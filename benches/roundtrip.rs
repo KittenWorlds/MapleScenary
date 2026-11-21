@@ -65,24 +65,52 @@ fn maple_throughput(stream: bool) -> Sample {
     let mut config = Config::compact();
     config.force_stream = stream;
     let (client, server) = pair(config).expect("maple pair");
-    let payload = vec![0xa5u8; THROUGHPUT_CHUNK];
-    let iterations = THROUGHPUT_BYTES / THROUGHPUT_CHUNK as u64;
-    let start = Instant::now();
-    for _ in 0..iterations {
-        client
-            .send_timeout(2, &payload, Duration::from_secs(10))
-            .expect("send");
-        let message = server.recv(WAIT).expect("recv");
-        black_box(message.bytes());
-    }
-    let elapsed = start.elapsed();
-    let mib = THROUGHPUT_BYTES as f64 / (1024.0 * 1024.0);
-    Sample {
-        library: if stream {
+    throughput(
+        if stream {
             "maple-scenary (stream)"
         } else {
             "maple-scenary"
         },
+        move |payload| {
+            client
+                .send_timeout(2, payload, Duration::from_secs(10))
+                .expect("send");
+        },
+        move || {
+            black_box(server.recv(WAIT).expect("recv").bytes());
+        },
+    )
+}
+
+/// Throughput is measured with the receiver on a second thread: the stream
+/// fallback writes whole frames into the socket, so a single thread that sends
+/// before it reads can deadlock once a message outgrows the socket buffer
+/// (macOS defaults to 8 KiB). Separate reader/writer threads also match how a
+/// real host talks to a renderer process.
+fn throughput(
+    library: &'static str,
+    send: impl Fn(&[u8]),
+    recv: impl Fn() + Send + 'static,
+) -> Sample {
+    let payload = vec![0xa5u8; THROUGHPUT_CHUNK];
+    let iterations = THROUGHPUT_BYTES / THROUGHPUT_CHUNK as u64;
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        ready_tx.send(()).expect("ready");
+        for _ in 0..iterations {
+            recv();
+        }
+    });
+    ready_rx.recv().expect("receiver ready");
+    let start = Instant::now();
+    for _ in 0..iterations {
+        send(&payload);
+    }
+    let elapsed = start.elapsed();
+    reader.join().expect("receiver thread");
+    let mib = THROUGHPUT_BYTES as f64 / (1024.0 * 1024.0);
+    Sample {
+        library,
         workload: "throughput-64KiB",
         value: mib / elapsed.as_secs_f64(),
         unit: "MiB/s",
@@ -114,22 +142,13 @@ fn ipc_channel_latency() -> Sample {
 
 fn ipc_channel_throughput() -> Sample {
     let (sender, receiver) = ipc::channel::<Vec<u8>>().expect("ipc-channel");
-    let payload = vec![0xa5u8; THROUGHPUT_CHUNK];
-    let iterations = THROUGHPUT_BYTES / THROUGHPUT_CHUNK as u64;
-    let start = Instant::now();
-    for _ in 0..iterations {
-        sender.send(payload.clone()).expect("send");
-        black_box(receiver.recv().expect("recv"));
-    }
-    let elapsed = start.elapsed();
-    let mib = THROUGHPUT_BYTES as f64 / (1024.0 * 1024.0);
-    Sample {
-        library: "ipc-channel",
-        workload: "throughput-64KiB",
-        value: mib / elapsed.as_secs_f64(),
-        unit: "MiB/s",
-        ops_per_sec: iterations as f64 / elapsed.as_secs_f64(),
-    }
+    throughput(
+        "ipc-channel",
+        move |payload| sender.send(payload.to_vec()).expect("send"),
+        move || {
+            black_box(receiver.recv().expect("recv"));
+        },
+    )
 }
 
 fn measure(label: &str, run: impl FnOnce() -> Sample) -> Option<Sample> {

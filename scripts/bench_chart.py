@@ -81,8 +81,10 @@ def markdown(entries):
         "Generated from the CI matrix (Linux, macOS, Windows). Lower latency and "
         "higher throughput are better. `ipc-channel` is measured with `Vec<u8>` "
         "payloads, so serialization is included; MapleScenary sends raw bytes. "
-        "Runner hardware differs per platform, so compare libraries inside a row, "
-        "not absolute numbers across rows.",
+        "Throughput runs the receiver on a dedicated thread so the writer and "
+        "reader overlap, as between real processes. Runner hardware differs per "
+        "platform, so compare libraries inside a row, not absolute numbers "
+        "across rows.",
         "",
         "### Latency (64 B roundtrip, µs/op)",
         "",

@@ -64,6 +64,26 @@ pub(crate) fn pop_slot(
     Some(slot)
 }
 
+/// Payload bytes of the descriptors currently between `tail` and `head`.
+///
+/// Used for diagnostics only: the producer may be writing concurrently, so the
+/// scan is bounded by the ring capacity and never pops anything.
+pub(crate) fn pending_bytes(region: &Region, ring: RingSpec, head: u32, tail: u32) -> u64 {
+    let mut total = 0u64;
+    let mut position = tail;
+    let mut remaining = head.wrapping_sub(tail).min(ring.capacity);
+    while remaining > 0 {
+        let offset = ring.offset + ring.index(position) * SLOT_LEN;
+        let bytes = region.slice(offset, SLOT_LEN);
+        // SAFETY: `Slot` is plain-old-data and the slice has exactly its size.
+        let slot = unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast::<Slot>()) };
+        total += u64::from(slot.len);
+        position = position.wrapping_add(1);
+        remaining -= 1;
+    }
+    total
+}
+
 pub(crate) fn push_return(
     region: &Region,
     ring: RingSpec,

@@ -51,6 +51,13 @@ pub struct ChannelStats {
     pub leaked_blocks: u64,
     pub wakeups_sent: u64,
     pub wakeups_received: u64,
+    /// Messages this half published or still has to receive, depending on which
+    /// half queried the snapshot.
+    pub queued_messages: u32,
+    /// Payload bytes of [`ChannelStats::queued_messages`].
+    pub queued_bytes: u64,
+    /// Returned blocks waiting to be reclaimed by this half.
+    pub return_backlog: u32,
 }
 
 #[derive(Default)]
@@ -80,6 +87,7 @@ impl Stats {
             leaked_blocks: self.leaked_blocks.load(Ordering::Relaxed),
             wakeups_sent: self.wakeups_sent.load(Ordering::Relaxed),
             wakeups_received: self.wakeups_received.load(Ordering::Relaxed),
+            ..ChannelStats::default()
         }
     }
 }
@@ -325,6 +333,21 @@ impl ShmSender {
         }
     }
 
+    /// `(queued messages, queued payload bytes, returned blocks awaiting reclaim)`.
+    fn watermarks(&self) -> (u32, u64, u32) {
+        let header = self.region.header();
+        let (head, tail) = self.side.send_ring_atomics(header);
+        let head = head.load(Ordering::Acquire);
+        let tail = tail.load(Ordering::Relaxed);
+        let bytes =
+            ring::pending_bytes(&self.region, self.side.send_ring(&self.layout), head, tail);
+        let (return_head, return_tail) = self.side.return_atomics(header);
+        let backlog = return_head
+            .load(Ordering::Acquire)
+            .wrapping_sub(return_tail.load(Ordering::Relaxed));
+        (head.wrapping_sub(tail), bytes, backlog)
+    }
+
     fn try_send(
         &self,
         kind: u32,
@@ -499,6 +522,21 @@ impl ShmReceiver {
         let header = self.region.header();
         let (head, tail) = self.side.recv_ring_atomics(header);
         head.load(Ordering::Acquire) != tail.load(Ordering::Relaxed)
+    }
+
+    /// `(queued messages, queued payload bytes, returned blocks awaiting reclaim)`.
+    fn watermarks(&self) -> (u32, u64, u32) {
+        let header = self.region.header();
+        let (head, tail) = self.side.recv_ring_atomics(header);
+        let head = head.load(Ordering::Acquire);
+        let tail = tail.load(Ordering::Relaxed);
+        let bytes =
+            ring::pending_bytes(&self.region, self.side.recv_ring(&self.layout), head, tail);
+        let (return_head, return_tail) = self.side.return_atomics(header);
+        let backlog = return_head
+            .load(Ordering::Acquire)
+            .wrapping_sub(return_tail.load(Ordering::Relaxed));
+        (head.wrapping_sub(tail), bytes, backlog)
     }
 
     fn try_recv(&self, stats: &Stats, transport: &Transport) -> Result<Option<Message>> {
@@ -808,9 +846,21 @@ impl Sender {
         }
     }
 
-    /// Current counters.
+    /// Current counters and queue watermarks.
+    ///
+    /// For a sender, `queued_messages`/`queued_bytes` describe messages the peer
+    /// has not consumed yet. Stream-fallback channels have no rings, so the
+    /// watermarks stay 0.
     pub fn stats(&self) -> ChannelStats {
-        self.stats.snapshot()
+        let mut stats = self.stats.snapshot();
+        if let SenderBackend::Shm(sender) = &self.backend {
+            (
+                stats.queued_messages,
+                stats.queued_bytes,
+                stats.return_backlog,
+            ) = sender.watermarks();
+        }
+        stats
     }
 }
 
@@ -1017,9 +1067,20 @@ impl Receiver {
         self.transport.close();
     }
 
-    /// Current counters.
+    /// Current counters and queue watermarks.
+    ///
+    /// For a receiver, `queued_messages`/`queued_bytes` describe the incoming
+    /// ring. Stream-fallback channels have no rings, so the watermarks stay 0.
     pub fn stats(&self) -> ChannelStats {
-        self.stats.snapshot()
+        let mut stats = self.stats.snapshot();
+        if let ReceiverBackend::Shm(receiver) = &self.backend {
+            (
+                stats.queued_messages,
+                stats.queued_bytes,
+                stats.return_backlog,
+            ) = receiver.watermarks();
+        }
+        stats
     }
 }
 
@@ -1339,6 +1400,9 @@ impl Channel {
     }
 
     /// Combined counters from both halves.
+    ///
+    /// Queue watermarks describe the sending half. Split the channel first when
+    /// the receiving half's ring depth is what matters.
     pub fn stats(&self) -> ChannelStats {
         self.sender.stats()
     }

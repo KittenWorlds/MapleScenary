@@ -303,6 +303,52 @@ fn watcher_wakes_stream() {
 }
 
 #[test]
+fn stats_report_queue_watermarks() {
+    let (client, server) = pair(compact()).expect("pair");
+    let (_, server_receiver) = server.split();
+    assert_eq!(client.stats().queued_messages, 0);
+    assert_eq!(server_receiver.stats().queued_bytes, 0);
+
+    client.send(1, b"aaaa").expect("send");
+    client.send(1, b"bb").expect("send");
+
+    let sender = client.stats();
+    assert_eq!(sender.queued_messages, 2);
+    assert_eq!(sender.queued_bytes, 6);
+    assert_eq!(sender.return_backlog, 0);
+    let receiver = server_receiver.stats();
+    assert_eq!(receiver.queued_messages, 2);
+    assert_eq!(receiver.queued_bytes, 6);
+
+    let first = server_receiver.try_recv().expect("recv").expect("message");
+    let second = server_receiver.try_recv().expect("recv").expect("message");
+    assert_eq!(server_receiver.stats().queued_messages, 0);
+    assert_eq!(first.bytes(), b"aaaa");
+    assert_eq!(second.bytes(), b"bb");
+    drop(first);
+    drop(second);
+
+    // Both blocks are back on the sender's return ring until its next
+    // allocation drains them.
+    assert_eq!(client.stats().return_backlog, 2);
+    client.send(1, b"c").expect("send");
+    assert_eq!(client.stats().return_backlog, 0);
+}
+
+#[test]
+fn stats_watermarks_are_zero_for_stream_fallback() {
+    let mut config = compact();
+    config.force_stream = true;
+    let (client, server) = pair(config).expect("pair");
+    let (_, receiver) = server.split();
+    client.send(1, b"payload").expect("send");
+    assert_eq!(client.stats().queued_messages, 0);
+    assert_eq!(client.stats().queued_bytes, 0);
+    assert_eq!(client.stats().return_backlog, 0);
+    assert_eq!(receiver.stats().queued_bytes, 0);
+}
+
+#[test]
 fn watcher_drains_before_reporting_close() {
     let (client, server) = pair(compact()).expect("pair");
     client.send(31, b"last").expect("send");

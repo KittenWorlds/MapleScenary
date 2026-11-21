@@ -139,6 +139,24 @@ match watcher.wait(Some(Duration::from_millis(16)))? {
 - `Watcher::try_wait()` 是零超时版本；超时返回 `Ready::Timeout` 而不是错误。
 - 共享内存模式等的是门铃字节；stream 回退改为等待 socket 可读，避免把帧首字节当作门铃吞掉。Windows 命名管道没有 `poll`，`Watcher` 在 stream 模式下退化为 1 ms `PeekNamedPipe` 轮询，共享内存模式仍走门铃。
 
+## 队列水位
+
+`stats()` 除了累计计数器，还直接给出环上的实时积压，省去宿主自己算：
+
+```rust
+let stats = client.stats();
+println!(
+    "queued {} messages / {} bytes, return backlog {}",
+    stats.queued_messages, stats.queued_bytes, stats.return_backlog,
+);
+```
+
+- `queued_messages` / `queued_bytes`：该半边发送环里尚未被对端取走的描述符数量与 payload 字节数。发送半看的是自己的发送环，接收半看的是自己的接收环。
+- `return_backlog`：归还环里等待本半回收的块数；持续偏高说明对端消费后迟迟不再分配，或回收速度跟不上。
+- `Channel::stats()` 描述发送半；要查询接收半的水位，先 `split()`，再用 `Receiver::stats()`。
+- stream 回退没有共享环，这三个字段恒为 0。
+- 字节数是诊断用的有界扫描（上限为环容量），不改变任何 head/tail，也不与生产者加锁。
+
 ## 布局
 
 ```

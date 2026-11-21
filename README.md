@@ -88,8 +88,9 @@ assert_eq!(b.recv(None)?.width, 1280);
 ## 可靠性与语义
 
 - `try_send`：无可用块或环满时立即返回 `WouldBlock`，不阻塞。
+- `send_many(kind, payloads)`：一次批量投递尽量多的消息，只写一次 doorbell；返回实际发送条数，短计数表示需要背压后重试剩余部分。
 - `send_timeout(kind, payload, timeout)`：共享内存模式下用 20µs → 1ms 指数退避轮询；stream 模式下等待 socket 可写。超时返回 `Timeout`。
-- `recv(timeout)`：`Some(Duration::ZERO)` 等价于非阻塞；`None` 一直等到消息或对端关闭。
+- `recv(timeout)`：先短自旋探测环（64 次），再阻塞在 doorbell 上；`Some(Duration::ZERO)` 等价于非阻塞；`None` 一直等到消息或对端关闭。
 - `Message` 借用共享内存；只要消息还活着，对应块不会被复用。`Drop` 后由发送方回收。
 - 关闭一侧的 `Channel` 会 shutdown 控制 socket，对端 `recv` 返回 `Disconnected`。
 - 共享内存布局校验（magic、版本、偏移、对齐、长度）在接收端执行，畸形描述符返回 `Protocol`/`Internal`。
@@ -128,14 +129,28 @@ cargo check --target aarch64-linux-android
 
 ## 基准测试
 
-`benches/roundtrip.rs` 测量 64 B 往返延迟与 64 KiB 吞吐，同时跑 MapleScenary（seqpacket/shm 与 stream 回退两种数据面）和同品类竞品 [`ipc-channel`](https://crates.io/crates/ipc-channel)（LavaCat 目前使用的库，按 `Vec<u8>` 收发，含序列化成本）：
+`benches/roundtrip.rs` 测量 64 B 往返延迟与 64 KiB 吞吐，覆盖五组口径：
+
+| 名称 | 含义 |
+|------|------|
+| `maple-scenary` | 默认 shm 数据面，`send`/`recv`，两端同进程 |
+| `maple-scenary (reserve)` | 零拷贝 `reserve`/`publish`，两端同进程 |
+| `maple-scenary (stream)` | 强制 stream 回退（整帧走 socket） |
+| `maple-scenary (2 proc)` | 真子进程，经 `Listener`/`connect` + 共享内存句柄传递 |
+| `ipc-channel` | 同品类竞品，`Vec<u8>` 收发，数字包含 serde/postcard 序列化 |
+
+每个数字是 `--repeats`（默认 3）次的中位数并带标准差；接收端会真正拷贝/校验 payload，吞吐不是「环空转」的虚高值。
 
 ```bash
 cargo bench --bench roundtrip
-cargo bench --bench roundtrip -- --json bench-results/linux.json
+cargo bench --bench roundtrip -- --json bench-results/linux.json --repeats 3
+cargo bench --bench roundtrip -- --save-baseline benches/baseline/ubuntu-latest.json
+cargo bench --bench roundtrip -- --baseline benches/baseline/ubuntu-latest.json --threshold 30
 ```
 
-CI 在 Ubuntu / macOS / Windows 三个 runner 上分别执行基准并上传 JSON；`bench-chart` job 用 `scripts/bench_chart.py` 汇总生成 `latency.png`、`throughput.png` 和 `summary.md`（`benchmark-report` artifact），并在 PR 中创建或更新对比评论。不同平台的 runner 硬件不同，横向比较请只在同一行内看各库优劣，不要跨平台比绝对值。
+`--baseline` 按 `(library, workload)` 对比中位数：延迟涨幅或吞吐跌幅超过 `--threshold` 百分比就以非零状态退出；基线文件不存在时只提示并跳过，方便首次接入。任何 benchmark 失败或 panic 都会记录到 JSON 的 `failures` 并使进程失败，不会静默丢样本。
+
+CI 在 Ubuntu / macOS / Windows 三个 runner 上分别执行基准、与 `benches/baseline/<runner>.json` 对比并上传 JSON。`bench-chart` job 只在三平台数据齐全、无 failure 时生成 `latency.png`、`throughput.png` 和 `summary.md`（`benchmark-report` artifact），并在 PR 中创建或更新对比评论；缺任一平台会直接失败而不是发半张表。不同 runner 硬件不同，横向比较请只在同一行内看各库优劣，不要跨平台比绝对值。
 
 ## C ABI
 
@@ -180,7 +195,7 @@ tests/integration.rs
 
 ## 状态
 
-v0.1 聚焦 Unix 家族（Linux / Android / macOS）与 Windows 的功能实现。Windows 后端已通过交叉 `cargo check`/`clippy`，运行时验证依赖 GitHub Actions 的 Windows job。Zig 优化路径（批量 memcpy、无分支分配器）留待后续版本。
+v0.1 聚焦 Unix 家族（Linux / Android / macOS）与 Windows 的功能实现。四平台（含 Windows 运行时）已在 GitHub Actions 上通过单元/集成测试；三平台基准数据由 CI 产出并在 PR 中自动对比。Zig 优化路径（批量 memcpy、无分支分配器）留待后续版本。
 
 ## 许可证
 

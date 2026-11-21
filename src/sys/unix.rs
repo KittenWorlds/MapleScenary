@@ -56,7 +56,7 @@ fn deadline_after(timeout: Option<Duration>) -> Option<Instant> {
     timeout.map(|timeout| Instant::now() + timeout)
 }
 
-fn wait_fd(fd: RawFd, events: libc::c_short, deadline: Option<Instant>) -> Result<()> {
+fn wait_fd_poll(fd: RawFd, events: libc::c_short, deadline: Option<Instant>) -> Result<()> {
     loop {
         let timeout_ms = match deadline {
             None => -1,
@@ -98,6 +98,83 @@ fn wait_fd(fd: RawFd, events: libc::c_short, deadline: Option<Instant>) -> Resul
             continue;
         }
         return Err(os_error("poll"));
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn wait_fd(fd: RawFd, events: libc::c_short, deadline: Option<Instant>) -> Result<()> {
+    wait_fd_poll(fd, events, deadline)
+}
+
+/// Darwin implements `poll` on top of `kevent`; for the single descriptor used
+/// here `select` skips that translation and is measurably cheaper.
+#[cfg(target_os = "macos")]
+fn wait_fd(fd: RawFd, events: libc::c_short, deadline: Option<Instant>) -> Result<()> {
+    if fd < 0 || fd >= libc::FD_SETSIZE as RawFd {
+        return wait_fd_poll(fd, events, deadline);
+    }
+    loop {
+        let mut timeout = match deadline {
+            None => None,
+            Some(deadline) => {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(timeout_error());
+                }
+                let left = deadline - now;
+                Some(libc::timeval {
+                    tv_sec: left.as_secs() as libc::time_t,
+                    tv_usec: left.subsec_micros().max(1) as libc::suseconds_t,
+                })
+            }
+        };
+        // SAFETY: zeroed fd_sets are valid; only bit `fd` is touched.
+        let mut readfds: libc::fd_set = unsafe { zeroed() };
+        let mut writefds: libc::fd_set = unsafe { zeroed() };
+        let want_read = events & libc::POLLIN != 0;
+        let want_write = events & libc::POLLOUT != 0;
+        // SAFETY: `fd` is a valid descriptor below FD_SETSIZE.
+        unsafe {
+            if want_read {
+                libc::FD_SET(fd, &mut readfds);
+            }
+            if want_write {
+                libc::FD_SET(fd, &mut writefds);
+            }
+        }
+        let timeout_ptr = match &mut timeout {
+            Some(timeout) => timeout as *mut libc::timeval,
+            None => ptr::null_mut(),
+        };
+        // SAFETY: descriptor sets and timeout outlive the call.
+        let rc = unsafe {
+            libc::select(
+                fd + 1,
+                if want_read {
+                    &mut readfds
+                } else {
+                    ptr::null_mut()
+                },
+                if want_write {
+                    &mut writefds
+                } else {
+                    ptr::null_mut()
+                },
+                ptr::null_mut(),
+                timeout_ptr,
+            )
+        };
+        if rc > 0 {
+            return Ok(());
+        }
+        if rc == 0 {
+            return Err(timeout_error());
+        }
+        let errno = last_errno();
+        if errno == libc::EINTR {
+            continue;
+        }
+        return Err(os_error("select"));
     }
 }
 
@@ -145,6 +222,25 @@ fn configure_stream(fd: RawFd) -> io::Result<()> {
     set_nonblocking(fd)?;
     set_no_sigpipe(fd);
     Ok(())
+}
+
+/// Grow socket buffers for stream framing. Darwin defaults to an 8 KiB send
+/// buffer, which forces 64 KiB frames through many partial writes. Failures are
+/// ignored: the kernel may cap the value.
+fn configure_buffers(fd: RawFd) {
+    let len: libc::c_int = 1024 * 1024;
+    for option in [libc::SO_SNDBUF, libc::SO_RCVBUF] {
+        // SAFETY: `fd` is a valid socket and `len` has the expected type.
+        unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                option,
+                &len as *const _ as *const libc::c_void,
+                size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+    }
 }
 
 /// A bound local endpoint.
@@ -199,6 +295,9 @@ impl Listener {
             return Err(os_error("socket"));
         }
         let guard = FdGuard(fd);
+        if kind == StreamKind::Stream {
+            configure_buffers(fd);
+        }
 
         if let Endpoint::Path(path) = endpoint
             && path.exists()
@@ -291,6 +390,9 @@ pub(crate) fn connect(name: &str, prefer_seqpacket: bool) -> Result<Stream> {
         }
         let guard = FdGuard(fd);
         configure_stream(fd).map_err(|err| Error::io("configure client", err))?;
+        if *kind == StreamKind::Stream {
+            configure_buffers(fd);
+        }
         let (addr, len) = endpoint.sockaddr()?;
         // SAFETY: `addr`/`len` describe a valid `sockaddr_un`.
         if unsafe { libc::connect(fd, &addr as *const _ as *const libc::sockaddr, len) } < 0 {
@@ -424,20 +526,41 @@ impl Stream {
         }
     }
 
-    pub(crate) fn send_all(&self, mut data: &[u8], timeout: Option<Duration>) -> Result<()> {
+    /// Write a small prefix and the payload with one `sendmsg`, falling back to
+    /// repeated calls for partial writes.
+    pub(crate) fn send_vectored(
+        &self,
+        prefix: &[u8],
+        payload: &[u8],
+        timeout: Option<Duration>,
+    ) -> Result<()> {
         let deadline = deadline_after(timeout);
-        while !data.is_empty() {
-            // SAFETY: `data` is a valid immutable slice.
-            let sent = unsafe {
-                libc::send(
-                    self.fd,
-                    data.as_ptr().cast::<libc::c_void>(),
-                    data.len(),
-                    SEND_FLAGS,
-                )
-            };
+        let mut head = prefix;
+        let mut body = payload;
+        while !head.is_empty() || !body.is_empty() {
+            let mut iov = [
+                libc::iovec {
+                    iov_base: head.as_ptr().cast_mut().cast::<libc::c_void>(),
+                    iov_len: head.len(),
+                },
+                libc::iovec {
+                    iov_base: body.as_ptr().cast_mut().cast::<libc::c_void>(),
+                    iov_len: body.len(),
+                },
+            ];
+            let count = if body.is_empty() { 1 } else { 2 };
+            // SAFETY: `msghdr` is zeroed and the iovecs stay valid for the call.
+            let mut message: libc::msghdr = unsafe { zeroed() };
+            message.msg_iov = iov.as_mut_ptr();
+            message.msg_iovlen = count as _;
+            // SAFETY: valid descriptor and a well-formed `msghdr`.
+            let sent = unsafe { libc::sendmsg(self.fd, &message, SEND_FLAGS) };
             if sent > 0 {
-                data = &data[sent as usize..];
+                let mut left = sent as usize;
+                let head_taken = left.min(head.len());
+                head = &head[head_taken..];
+                left -= head_taken;
+                body = &body[left.min(body.len())..];
                 continue;
             }
             if sent == 0 {
@@ -460,7 +583,7 @@ impl Stream {
                     "peer closed the socket",
                 ));
             }
-            return Err(os_error("send"));
+            return Err(os_error("sendmsg"));
         }
         Ok(())
     }
@@ -794,6 +917,10 @@ pub(crate) fn socket_pair(prefer_seqpacket: bool) -> Result<(Stream, Stream)> {
     }
     configure_stream(fds[0]).map_err(|err| Error::io("configure socketpair", err))?;
     configure_stream(fds[1]).map_err(|err| Error::io("configure socketpair", err))?;
+    if kind == StreamKind::Stream {
+        configure_buffers(fds[0]);
+        configure_buffers(fds[1]);
+    }
     Ok((Stream::new(fds[0], kind), Stream::new(fds[1], kind)))
 }
 

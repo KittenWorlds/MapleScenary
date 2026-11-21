@@ -21,9 +21,10 @@ pub const ABI_VERSION: u32 = 1;
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_SEND_TIMEOUT: Duration = Duration::from_secs(30);
 const STREAM_CHUNK: usize = 64 * 1024;
-/// Largest slice handed to a single socket write; keeps message-mode sockets
-/// below their datagram limit when the channel fell back to stream framing.
-const STREAM_WRITE_CHUNK: usize = 32 * 1024;
+/// Ring probes the receiver performs before parking on the doorbell. The
+/// producer usually publishes a few hundred nanoseconds before the wakeup
+/// syscall lands, so a short spin avoids two syscalls per message.
+const RECV_SPIN_ROUNDS: u32 = 64;
 
 /// Snapshot of channel counters, useful for benchmarks and diagnostics.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -197,13 +198,11 @@ impl Transport {
         let mut header = [0u8; 8];
         header[0..4].copy_from_slice(&(payload.len() as u32).to_le_bytes());
         header[4..8].copy_from_slice(&kind.to_le_bytes());
-        let result = (|| {
-            self.stream.send_all(&header, remaining(deadline))?;
-            for chunk in payload.chunks(STREAM_WRITE_CHUNK) {
-                self.stream.send_all(chunk, remaining(deadline))?;
-            }
-            Ok(())
-        })();
+        // Header and payload in one vectored write: fewer syscalls and no
+        // splitting on platforms with small socket buffers.
+        let result = self
+            .stream
+            .send_vectored(&header, payload, remaining(deadline));
         if result.is_err() {
             // A partially written frame desynchronizes the peer, so fail closed.
             self.poison();
@@ -308,9 +307,12 @@ impl ShmSender {
         };
         stats.allocations.fetch_add(1, Ordering::Relaxed);
         self.region.write(offset as usize, payload);
-        self.publish(offset, payload.len(), kind, transport, stats)
+        self.publish(offset, payload.len(), kind, transport, stats, true)
     }
 
+    /// Publish a slot. `notify` lets a batch write one doorbell for many
+    /// messages; callers that suppress it must ring it afterwards.
+    #[allow(clippy::too_many_arguments)]
     fn publish(
         &self,
         offset: u32,
@@ -318,6 +320,7 @@ impl ShmSender {
         kind: u32,
         transport: &Transport,
         stats: &Stats,
+        notify: bool,
     ) -> Result<()> {
         let header = self.region.header();
         let (head, tail) = self.side.send_ring_atomics(header);
@@ -338,13 +341,68 @@ impl ShmSender {
                 "message ring is full (apply backpressure)",
             ));
         }
-        if !self.side.send_notified(header).swap(true, Ordering::AcqRel) {
+        if notify && !self.side.send_notified(header).swap(true, Ordering::AcqRel) {
             transport.wake();
             stats.wakeups_sent.fetch_add(1, Ordering::Relaxed);
         }
         stats.sent_messages.fetch_add(1, Ordering::Relaxed);
         stats.sent_bytes.fetch_add(len as u64, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Ring the doorbell once after a batch of `notify = false` publishes.
+    fn flush_notification(&self, transport: &Transport, stats: &Stats) {
+        let header = self.region.header();
+        if !self.side.send_notified(header).swap(true, Ordering::AcqRel) {
+            transport.wake();
+            stats.wakeups_sent.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn try_send_many(
+        &self,
+        kind: u32,
+        payloads: &[&[u8]],
+        transport: &Transport,
+        stats: &Stats,
+    ) -> Result<usize> {
+        self.drain_returns(stats);
+        let mut sent = 0;
+        for payload in payloads {
+            if payload.len() > self.layout.max_message {
+                if sent > 0 {
+                    self.flush_notification(transport, stats);
+                }
+                return Err(Error::new(
+                    ErrorKind::MessageTooLarge,
+                    format!(
+                        "payload of {} B exceeds max_message_len {}",
+                        payload.len(),
+                        self.layout.max_message
+                    ),
+                ));
+            }
+            let Some(offset) = self.buddy.borrow_mut().alloc(payload.len()) else {
+                stats.send_would_block.fetch_add(1, Ordering::Relaxed);
+                break;
+            };
+            stats.allocations.fetch_add(1, Ordering::Relaxed);
+            self.region.write(offset as usize, payload);
+            match self.publish(offset, payload.len(), kind, transport, stats, false) {
+                Ok(()) => sent += 1,
+                Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+                Err(error) => {
+                    if sent > 0 {
+                        self.flush_notification(transport, stats);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        if sent > 0 {
+            self.flush_notification(transport, stats);
+        }
+        Ok(sent)
     }
 
     fn free(&self, offset: u32, len: usize) {
@@ -588,6 +646,28 @@ impl Sender {
         self.send_timeout(kind, payload, DEFAULT_SEND_TIMEOUT)
     }
 
+    /// Send as many payloads as fit, ringing the doorbell once for the whole
+    /// batch.
+    ///
+    /// Returns the number of messages published. A short count means the ring
+    /// or the sender's half of the region is full: apply backpressure and send
+    /// the remainder later. Messages counted as sent are already visible to the
+    /// peer even when a later one fails.
+    pub fn send_many(&self, kind: u32, payloads: &[&[u8]]) -> Result<usize> {
+        match &self.backend {
+            SenderBackend::Shm(sender) => {
+                sender.try_send_many(kind, payloads, &self.transport, &self.stats)
+            }
+            SenderBackend::Stream => {
+                for payload in payloads {
+                    self.transport
+                        .write_frame(kind, payload, Some(DEFAULT_SEND_TIMEOUT))?;
+                }
+                Ok(payloads.len())
+            }
+        }
+    }
+
     /// Reserve a payload buffer. With shared memory the returned slice points
     /// directly into the region, so filling it and calling
     /// [`Outgoing::publish`] performs no copy.
@@ -723,6 +803,14 @@ impl Receiver {
                     }
                     return Err(Error::new(ErrorKind::Disconnected, "channel is closed"));
                 }
+                // The producer publishes before the doorbell syscall lands, so
+                // probe the ring briefly before paying for poll()/recv().
+                for _ in 0..RECV_SPIN_ROUNDS {
+                    std::hint::spin_loop();
+                    if let Some(message) = receiver.try_recv(&self.stats, &self.transport)? {
+                        return Ok(message);
+                    }
+                }
                 let left = remaining(deadline);
                 if matches!(left, Some(left) if left.is_zero()) {
                     return Err(Error::new(ErrorKind::Timeout, "receive timed out"));
@@ -834,7 +922,7 @@ impl Outgoing<'_> {
                 len,
                 published: _,
                 buffer: _,
-            } => sender.publish(offset, len, kind, transport, stats),
+            } => sender.publish(offset, len, kind, transport, stats, true),
             OutgoingState::Buffered { sender, buffer } => {
                 sender.send_timeout(kind, &buffer, DEFAULT_SEND_TIMEOUT)
             }
@@ -948,6 +1036,11 @@ impl Channel {
     /// Attempt to send once without waiting for capacity.
     pub fn try_send(&self, kind: u32, payload: &[u8]) -> Result<()> {
         self.sender.try_send(kind, payload)
+    }
+
+    /// Send as many payloads as fit, ringing the doorbell once for the batch.
+    pub fn send_many(&self, kind: u32, payloads: &[&[u8]]) -> Result<usize> {
+        self.sender.send_many(kind, payloads)
     }
 
     /// Receive with an optional deadline.

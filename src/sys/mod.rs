@@ -21,7 +21,9 @@ pub(crate) type OwnedShm = std::os::fd::OwnedFd;
 #[cfg(windows)]
 pub(crate) type OwnedShm = std::os::windows::io::OwnedHandle;
 
-use crate::error::{Error, Result};
+#[cfg(unix)]
+use crate::error::Error;
+use crate::error::Result;
 
 /// Map a peer-provided shared-memory handle (or name) into this process.
 pub(crate) fn attach_shm(

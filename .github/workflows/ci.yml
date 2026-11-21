@@ -61,6 +61,7 @@ jobs:
           --repeats 5
           --baseline "benches/baseline/${{ matrix.os }}.json"
           --threshold 40
+          --throughput-threshold 70
       - uses: actions/upload-artifact@v4
         with:
           name: bench-${{ matrix.os }}

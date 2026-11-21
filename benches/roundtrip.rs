@@ -493,7 +493,8 @@ fn read_baseline(path: &str) -> Result<Vec<(String, String, f64, String)>, Strin
 fn check_regressions(
     baseline: &[(String, String, f64, String)],
     measurements: &[Measurement],
-    threshold: f64,
+    latency_threshold: f64,
+    throughput_threshold: f64,
 ) -> Vec<String> {
     let mut regressions = Vec::new();
     for measurement in measurements {
@@ -508,6 +509,13 @@ fn check_regressions(
         };
         let current = measurement.median();
         let change = (current - base) / *base * 100.0;
+        // Shared CI runners vary a lot in memory bandwidth, but are far more
+        // consistent on latency, so use a much looser throughput threshold.
+        let threshold = if measurement.unit == "ns/op" {
+            latency_threshold
+        } else {
+            throughput_threshold
+        };
         let regressed = if measurement.unit == "ns/op" {
             change > threshold
         } else {
@@ -521,6 +529,40 @@ fn check_regressions(
         }
     }
     regressions
+}
+
+/// Hardware-independent contract: on the same runner the shared-memory path
+/// must stay at least this many times faster than `ipc-channel`.
+const MIN_THROUGHPUT_RATIO: f64 = 2.0;
+
+fn check_competitor_ratio(measurements: &[Measurement]) -> Vec<String> {
+    let Some(competitor) = measurements
+        .iter()
+        .find(|measurement| {
+            measurement.library == "ipc-channel" && measurement.workload == "throughput-64KiB"
+        })
+        .map(Measurement::median)
+    else {
+        return Vec::new();
+    };
+    let mut failures = Vec::new();
+    for measurement in measurements {
+        if measurement.workload != "throughput-64KiB"
+            || !measurement.library.starts_with("maple-scenary")
+            || measurement.library.contains("stream")
+            || measurement.library.contains("2 proc")
+        {
+            continue;
+        }
+        let ratio = measurement.median() / competitor;
+        if ratio < MIN_THROUGHPUT_RATIO {
+            failures.push(format!(
+                "{} throughput is only {:.2}x ipc-channel (minimum {MIN_THROUGHPUT_RATIO:.1}x)",
+                measurement.library, ratio
+            ));
+        }
+    }
+    failures
 }
 
 fn print_table(measurements: &[Measurement]) {
@@ -545,6 +587,7 @@ fn main() {
     let mut save_baseline = None;
     let mut baseline_path = None;
     let mut threshold = 30.0f64;
+    let mut throughput_threshold = 70.0f64;
     let mut repeats = DEFAULT_REPEATS;
     let mut platform = std::env::var("BENCH_PLATFORM")
         .unwrap_or_else(|_| format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH));
@@ -571,6 +614,11 @@ fn main() {
             "--threshold" => {
                 if let Some(value) = args.next() {
                     threshold = value.parse().unwrap_or(30.0);
+                }
+            }
+            "--throughput-threshold" => {
+                if let Some(value) = args.next() {
+                    throughput_threshold = value.parse().unwrap_or(70.0);
                 }
             }
             "--repeats" => {
@@ -657,9 +705,13 @@ fn main() {
     if let Some(path) = baseline_path.as_deref() {
         match read_baseline(path) {
             Ok(baseline) => {
-                let regressions = check_regressions(&baseline, &measurements, threshold);
+                let regressions =
+                    check_regressions(&baseline, &measurements, threshold, throughput_threshold);
                 if regressions.is_empty() {
-                    println!("no regression above {threshold:.0}% against {path}");
+                    println!(
+                        "no regression above {threshold:.0}% latency / \
+                         {throughput_threshold:.0}% throughput against {path}"
+                    );
                 } else {
                     for regression in &regressions {
                         eprintln!("regression: {regression}");
@@ -670,6 +722,12 @@ fn main() {
             Err(error) => println!("baseline {path} is unavailable ({error}); skipping check"),
         }
     }
+
+    let ratio_failures = check_competitor_ratio(&measurements);
+    for failure in &ratio_failures {
+        eprintln!("contract: {failure}");
+    }
+    failures.extend(ratio_failures);
 
     if let Some(path) = json_path.as_deref()
         && let Err(error) = write_results(path, &platform, &measurements, &failures)

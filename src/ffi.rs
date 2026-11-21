@@ -5,7 +5,7 @@
 //! negative code matching [`ErrorKind::ffi_code`]. The last failure message is
 //! available through [`maple_last_error_message`].
 //!
-//! ```
+//! ```c
 //! // From C:
 //! //   maple_config cfg; maple_config_default(&cfg);
 //! //   maple_channel *a, *b;

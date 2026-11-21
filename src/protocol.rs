@@ -237,3 +237,70 @@ impl<'a> Reader<'a> {
         self.take(len)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+
+    #[test]
+    fn hello_rejects_every_truncated_prefix() {
+        let bytes = Hello::new(&Config::compact()).encode();
+        for len in 0..bytes.len() {
+            assert!(
+                Hello::decode(&bytes[..len]).is_err(),
+                "prefix of {len} B must be rejected"
+            );
+        }
+        assert!(Hello::decode(&bytes).is_ok());
+    }
+
+    #[test]
+    fn hello_rejects_a_foreign_protocol_version() {
+        let mut bytes = Hello::new(&Config::compact()).encode();
+        bytes[4..6].copy_from_slice(&PROTO_VERSION.wrapping_add(1).to_le_bytes());
+        let error = Hello::decode(&bytes).expect_err("version mismatch");
+        assert!(error.message().contains("protocol"), "{error}");
+    }
+
+    #[test]
+    fn hello_rejects_bad_magic() {
+        let mut bytes = Hello::new(&Config::compact()).encode();
+        bytes[0] ^= 0xFF;
+        assert!(Hello::decode(&bytes).is_err());
+    }
+
+    #[test]
+    fn welcome_rejects_every_truncated_prefix() {
+        let bytes = Welcome::ok(&Config::compact(), Mode::SharedMemory, "region".into()).encode();
+        for len in 0..bytes.len() {
+            assert!(
+                Welcome::decode(&bytes[..len]).is_err(),
+                "prefix of {len} B must be rejected"
+            );
+        }
+        assert!(Welcome::decode(&bytes).is_ok());
+    }
+
+    #[test]
+    fn welcome_rejects_an_unknown_transport_mode() {
+        let mut bytes = Welcome::ok(&Config::compact(), Mode::Stream, String::new()).encode();
+        bytes[8] = 9;
+        assert!(Welcome::decode(&bytes).is_err());
+    }
+
+    #[test]
+    fn welcome_rejects_oversized_and_invalid_region_names() {
+        let mut bytes = Welcome::ok(&Config::compact(), Mode::SharedMemory, "x".into()).encode();
+        // name_len sits at offset 36; a huge value must not trigger a panic or
+        // an out-of-bounds read.
+        bytes[36..40].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(Welcome::decode(&bytes).is_err());
+
+        let mut bytes = Welcome::ok(&Config::compact(), Mode::SharedMemory, "x".into()).encode();
+        // The single name byte at offset 40 is replaced with an invalid start
+        // byte, so UTF-8 validation has to reject it.
+        bytes[40] = 0xFF;
+        assert!(Welcome::decode(&bytes).is_err());
+    }
+}

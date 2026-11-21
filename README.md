@@ -181,6 +181,8 @@ cargo bench            # 延迟 / 吞吐
 cargo build --release  # 生成 cdylib + staticlib
 ```
 
+集成测试里有一组崩溃恢复用例：测试二进制会以子进程方式重新启动自己，在 `reserve` / `publish` / 持有消息未归还三个阶段直接 `exit`，验证对端能观测到关闭、关闭前已发布的消息仍可读出，且不会死锁或 panic。环回绕、满环和畸形握手/头部的用例是普通单元测试，不需要额外工具链。
+
 四平台检查（需要对应 target）：
 
 ```bash

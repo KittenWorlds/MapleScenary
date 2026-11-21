@@ -360,3 +360,112 @@ fn watcher_drains_before_reporting_close() {
     assert_eq!(message.bytes(), b"last");
     assert_eq!(watcher.wait(WAIT).expect("wait closed"), Ready::Closed);
 }
+
+const CRASH_NAME_ENV: &str = "MAPLE_TEST_CRASH_ENDPOINT";
+const CRASH_PHASE_ENV: &str = "MAPLE_TEST_CRASH_PHASE";
+
+fn spawn_crash_child(name: &str, phase: &str) -> std::process::Child {
+    std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args(["--exact", "crash_child_helper", "--nocapture"])
+        .env(CRASH_NAME_ENV, name)
+        .env(CRASH_PHASE_ENV, phase)
+        .spawn()
+        .expect("spawn crash child")
+}
+
+fn wait_for_child(child: &mut std::process::Child) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = child.try_wait().expect("try_wait") {
+            assert!(status.success(), "crash child exited with {status}");
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            panic!("crash child did not exit in time");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Runs inside the spawned test binary; `process::exit` skips every destructor,
+/// which is what makes this a crash rather than a clean shutdown.
+#[test]
+fn crash_child_helper() {
+    let Ok(name) = std::env::var(CRASH_NAME_ENV) else {
+        return;
+    };
+    let phase = std::env::var(CRASH_PHASE_ENV).expect("crash phase");
+    let channel = maple_scenary::connect(&name, compact()).expect("child connect");
+    match phase.as_str() {
+        "reserve" => {
+            std::mem::forget(channel.reserve(channel.max_message_len()).expect("reserve"));
+            std::process::exit(0);
+        }
+        "publish" => {
+            channel.send(77, b"published before crash").expect("send");
+            std::process::exit(0);
+        }
+        "hold" => {
+            let message = channel.recv(WAIT).expect("child recv");
+            assert_eq!(message.bytes(), b"hold this");
+            std::mem::forget(message);
+            std::process::exit(0);
+        }
+        other => panic!("unknown crash phase {other}"),
+    }
+}
+
+fn crash_roundtrip(phase: &str, config: Config) {
+    // The mode belongs in the name: both tests share one process id and run in
+    // parallel.
+    let mode = if config.force_stream { "stream" } else { "shm" };
+    let name = endpoint(&format!("crash-{phase}-{mode}"));
+    let listener = Listener::bind(&name, config).expect("bind");
+    let mut child = spawn_crash_child(&name, phase);
+    let server = listener.accept(WAIT).expect("accept");
+    if phase == "hold" {
+        server.send(1, b"hold this").expect("send to child");
+    }
+    wait_for_child(&mut child);
+
+    match phase {
+        "publish" => {
+            // The payload was published before the crash, so it stays readable.
+            let message = server.recv(WAIT).expect("published message survives");
+            assert_eq!(message.kind(), 77);
+            assert_eq!(message.bytes(), b"published before crash");
+        }
+        "hold" => {
+            // The block died with the child. The next send must fail cleanly
+            // instead of blocking or panicking on a half-returned block.
+            if let Err(error) = server.try_send(2, b"after crash") {
+                assert!(matches!(
+                    error.kind(),
+                    ErrorKind::WouldBlock | ErrorKind::Disconnected | ErrorKind::Closed
+                ));
+            }
+        }
+        _ => {}
+    }
+
+    // Peer death must be observable without hanging, whatever the phase.
+    assert_eq!(server.watcher().wait(WAIT).expect("wait"), Ready::Closed);
+    assert!(server.is_closed());
+}
+
+#[test]
+fn crash_peer_shared_memory() {
+    for phase in ["reserve", "publish", "hold"] {
+        crash_roundtrip(phase, compact());
+    }
+}
+
+#[test]
+fn crash_peer_stream_fallback() {
+    let mut config = compact();
+    config.force_stream = true;
+    for phase in ["publish", "hold"] {
+        crash_roundtrip(phase, config.clone());
+    }
+}

@@ -212,13 +212,20 @@ impl RequestIds {
 
     /// Allocate a unique ID, failing permanently once all nonzero IDs are used.
     pub fn next_id(&self) -> Result<NonZeroU64> {
-        self.next
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
-                (next != 0).then_some(next.wrapping_add(1))
-            })
-            .ok()
-            .and_then(NonZeroU64::new)
-            .ok_or_else(|| Error::new(ErrorKind::Internal, "request IDs exhausted"))
+        let mut next = self.next.load(Ordering::Relaxed);
+        loop {
+            let id = NonZeroU64::new(next)
+                .ok_or_else(|| Error::new(ErrorKind::Internal, "request IDs exhausted"))?;
+            match self.next.compare_exchange_weak(
+                next,
+                next.wrapping_add(1),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Ok(id),
+                Err(actual) => next = actual,
+            }
+        }
     }
 }
 

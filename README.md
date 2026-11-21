@@ -192,7 +192,7 @@ cargo bench --bench roundtrip -- --save-baseline benches/baseline/ubuntu-latest.
 cargo bench --bench roundtrip -- --baseline benches/baseline/ubuntu-latest.json --threshold 30
 ```
 
-`--baseline` 按 `(library, workload)` 对比中位数：延迟涨幅超过 `--threshold`、或吞吐跌幅超过 `--throughput-threshold`（默认 70%）就以非零状态退出。共享 runner 的绝对性能波动大，CI 用较宽的阈值（延迟 100%、吞吐 70%），并额外执行一条与硬件无关的硬约束：同一 runner 上 shm 路径吞吐必须 ≥ 2× `ipc-channel`、延迟必须 ≤ 2× `ipc-channel`。门禁只覆盖进程内路径；`2 proc` 系列只展示、不设绝对阈值（跨进程调度噪声太大）。基线文件不存在时只提示并跳过，方便首次接入。任何 benchmark 失败或 panic 都会记录到 JSON 的 `failures` 并使进程失败，不会静默丢样本。
+`--baseline` 按 `(library, workload)` 对比中位数：延迟涨幅超过 `--threshold`、或吞吐跌幅超过 `--throughput-threshold`（默认 70%）就以非零状态退出。共享 runner 的绝对性能波动大（Windows 上同一 workload 跨 run 见过 3.4× 的差异），CI 用较宽的阈值（延迟 100%、吞吐 80%）只兜底灾难性回退，真正阻断的是与硬件无关的 2× 竞品契约：同一 runner 上 shm 路径吞吐必须 ≥ 2× `ipc-channel`、延迟必须 ≤ 2× `ipc-channel`。门禁只覆盖进程内路径；`2 proc` 系列只展示、不设绝对阈值（跨进程调度噪声太大）。基线文件不存在时只提示并跳过，方便首次接入。任何 benchmark 失败或 panic 都会记录到 JSON 的 `failures` 并使进程失败，不会静默丢样本；CI 即使门禁失败也会上传原始 JSON 便于排查。
 
 CI 在 Ubuntu / macOS / Windows 三个 runner 上分别执行基准（5 次取中位数）、与 `benches/baseline/<runner>.json` 对比并上传 JSON。`bench-chart` job 只在三平台数据齐全、无 failure 时生成 `latency.png`、`throughput.png` 和 `summary.md`（`benchmark-report` artifact），并在 PR 中创建或更新对比评论；缺任一平台会直接失败而不是发半张表。不同 runner 硬件不同，横向比较请只在同一行内看各库优劣，不要跨平台比绝对值。
 

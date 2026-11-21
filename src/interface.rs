@@ -278,11 +278,20 @@ impl InterfaceOutgoing<'_> {
 /// Capacity and publication follow [`Sender::reserve`] and [`Outgoing::publish`]
 /// semantics. Shared-memory allocation may return [`ErrorKind::WouldBlock`].
 /// Stream mode uses the existing buffered fallback.
-pub fn reserve(sender: &Sender, header: Header, payload_len: usize) -> Result<InterfaceOutgoing<'_>> {
+pub fn reserve(
+    sender: &Sender,
+    header: Header,
+    payload_len: usize,
+) -> Result<InterfaceOutgoing<'_>> {
     let len = payload_len
         .checked_add(HEADER_LEN)
         .filter(|len| *len <= sender.max_message_len())
-        .ok_or_else(|| Error::new(ErrorKind::MessageTooLarge, "interface message exceeds limit"))?;
+        .ok_or_else(|| {
+            Error::new(
+                ErrorKind::MessageTooLarge,
+                "interface message exceeds limit",
+            )
+        })?;
     let mut inner = sender.reserve(len)?;
     inner.buffer_mut()[..HEADER_LEN].copy_from_slice(&header.encode());
     Ok(InterfaceOutgoing { inner })
@@ -320,7 +329,10 @@ mod tests {
                 })
             })
             .collect();
-        let mut values: Vec<_> = threads.into_iter().flat_map(|t| t.join().unwrap()).collect();
+        let mut values: Vec<_> = threads
+            .into_iter()
+            .flat_map(|t| t.join().unwrap())
+            .collect();
         values.sort_unstable();
         values.dedup();
         assert_eq!(values.len(), 400);
@@ -335,8 +347,8 @@ mod tests {
         assert_eq!(
             encoded,
             [
-                b'M', b'I', b'F', b'C', 1, 0, 1, 0, 1, 2, 3, 4, 9, 0, 0, 0,
-                2, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0,
+                b'M', b'I', b'F', b'C', 1, 0, 1, 0, 1, 2, 3, 4, 9, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0,
+                7, 0, 0, 0, 0, 0, 0, 0,
             ]
         );
         for len in 0..HEADER_LEN {
@@ -357,7 +369,10 @@ mod tests {
         assert!(header.response().unwrap().response().is_err());
         assert!(header.validate_for(0x0403_0201, 2).is_ok());
         assert!(header.validate_for(0x0403_0201, 3).is_ok());
-        assert_eq!(header.validate_for(1, 2).unwrap_err().kind(), ErrorKind::Protocol);
+        assert_eq!(
+            header.validate_for(1, 2).unwrap_err().kind(),
+            ErrorKind::Protocol
+        );
         assert_eq!(
             header.validate_for(0x0403_0201, 1).unwrap_err().kind(),
             ErrorKind::Unsupported

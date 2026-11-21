@@ -90,7 +90,9 @@ fn malformed_envelope_does_not_consume_next_message() {
         let (sender, receiver) = pair(config).unwrap();
         sender.send(INTERFACE_KIND, b"short").unwrap();
         sender.send(7, b"raw").unwrap();
-        sender.send(INTERFACE_KIND, &Header::one_way(1, 2, 0).encode()).unwrap();
+        sender
+            .send(INTERFACE_KIND, &Header::one_way(1, 2, 0).encode())
+            .unwrap();
         for _ in 0..2 {
             let error = InterfaceMessage::from_message(receiver.recv(WAIT).unwrap())
                 .err()

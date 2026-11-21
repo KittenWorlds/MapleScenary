@@ -34,8 +34,8 @@
 
 ## P3 接口层与工程
 
-- [ ] `u32 kind` 换成轻量 schema（哪怕一张 enum 表 + 版本号），支持字段级 MinVersion 式兼容
-- [ ] 请求-响应关联（correlation id），别让业务层自己拿 `kind` 凑
+- [ ] `u32 kind` 换成轻量 schema（哪怕一张 enum 表 + 版本号），支持字段级 MinVersion 式兼容（已提供可选 interface 信封的接口 ID / method / min_version 校验；字段级 schema 与编解码仍待实现）
+- [x] 请求-响应关联（correlation id）：`interface::{Header, RequestIds, InterfaceMessage}`，支持请求/响应匹配和乱序分发；pending 表与超时由业务管理
 - [ ] C ABI 稳定化声明：明确哪些 ABI 保证不变、`ABI_VERSION` 不兼容时如何拒绝握手
 - [ ] Zig 优化路径给出 go/no-go 结论，别一直挂着「预留」
 - [ ] 补人工 code review（目前 PR #1/#2 都是零评审直接合）

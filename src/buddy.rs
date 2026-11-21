@@ -86,10 +86,8 @@ impl Buddy {
 
     fn take_free(&mut self, order: u8) -> Option<u32> {
         let blocks = self.blocks(order);
-        let words = self.free[order as usize].len();
-        for word in 0..words {
-            let value = self.free[order as usize][word];
-            if value == 0 {
+        for (word, value) in self.free[order as usize].iter_mut().enumerate() {
+            if *value == 0 {
                 continue;
             }
             let bit = value.trailing_zeros() as usize;
@@ -97,7 +95,7 @@ impl Buddy {
             if index >= blocks {
                 continue;
             }
-            self.free[order as usize][word] &= !(1u64 << bit);
+            *value &= !(1u64 << bit);
             return Some(index);
         }
         None

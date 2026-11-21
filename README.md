@@ -271,3 +271,55 @@ v0.1 聚焦 Unix 家族（Linux / Android / macOS）与 Windows 的功能实现�
 ## 许可证
 
 LGPL-3.0-or-later，见 [LICENSE](LICENSE) 与 [COPYING](COPYING)。
+
+## 轻量接口消息与请求关联
+
+`maple_scenary::interface` 在现有 Channel 上提供可选使用的 32 字节信封，无额外依赖。
+它包含接口 ID、方法号、最低接口版本、消息类型和非零请求 ID，支持单向消息、请求及乱序响应。
+接收端仍然借用原消息内存；`interface::reserve` 可直接填充共享内存中的业务 payload。
+
+```rust
+use maple_scenary::{Config, pair};
+use maple_scenary::interface::{self, Header, InterfaceMessage, RequestIds};
+use std::time::Duration;
+
+let (client, server) = pair(Config::compact())?;
+let (client_tx, client_rx) = client.split();
+let (server_tx, server_rx) = server.split();
+let ids = RequestIds::new(); // 每个发送方向长期保留一份，不在请求间重置
+let request = Header::request(10, 4, 1, ids.next_id()?);
+interface::send(&client_tx, request, b"ping")?;
+
+let incoming = InterfaceMessage::from_message(server_rx.recv(Some(Duration::from_secs(1)))?)?;
+incoming.header().validate_for(10, 1)?; // 解码 payload 前检查接口和最低版本
+interface::send(&server_tx, incoming.header().response()?, b"pong")?;
+
+let response = InterfaceMessage::from_message(client_rx.recv(Some(Duration::from_secs(1)))?)?;
+assert!(response.header().is_response_to(request));
+assert_eq!(response.payload(), b"pong");
+# Ok::<(), maple_scenary::Error>(())
+```
+
+这是 framing/correlation 层：业务负责 pending 请求表、超时、取消、重复响应处理和方法分发。
+它不会等待指定响应或丢弃交错的事件，也不提供同步 RPC、自动版本协商或字段级序列化。
+`min_version` 表示解码该方法及 payload 所需的最低接口版本；字段布局和可选字段兼容规则由业务定义。
+接口信封版本、底层握手协议版本及 C ABI 版本相互独立，本次未改变现有 raw/typed API。
+
+线格式全部使用 little-endian，外层 kind 为 `u32::MAX - 1`（typed 使用 `u32::MAX`）。
+payload 长度由外层 Channel 帧限定；`max_message_len` 包括这 32 字节头。
+未知信封版本、消息类型、非零保留位及非法请求 ID 组合均被拒绝。
+
+| 字节偏移 | 类型 | 含义 |
+| --- | --- | --- |
+| 0 | 4 bytes | magic：ASCII `MIFC` |
+| 4 | u16 | 信封版本：1 |
+| 6 | u16 | 类型：0 单向、1 请求、2 响应 |
+| 8 | u32 | interface ID |
+| 12 | u32 | method ordinal |
+| 16 | u32 | min_version |
+| 20 | u32 | 保留，必须为 0 |
+| 24 | u64 | request ID，单向必须为 0，请求/响应必须非零 |
+
+与 Mojo 对标的当前边界：共享内存消息、事件循环接入和请求关联已有基础实现；
+端点跨进程转移、Broker/Invitation 路由、IDL 代码生成及完整能力权限模型尚未提供。
+Android 当前由交叉编译检查覆盖，运行时长稳测试仍待完成。

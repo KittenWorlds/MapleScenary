@@ -67,6 +67,7 @@ mod sys;
 pub mod channel;
 pub mod config;
 pub mod error;
+pub mod interface;
 pub mod listener;
 #[cfg(feature = "typed")]
 pub mod typed;

@@ -497,6 +497,10 @@ fn check_regressions(
 ) -> Vec<String> {
     let mut regressions = Vec::new();
     for measurement in measurements {
+        // Only gate our own paths: competitor numbers are informational.
+        if !measurement.library.starts_with("maple-scenary") {
+            continue;
+        }
         let Some((_, _, base, _)) = baseline.iter().find(|(library, workload, _, _)| {
             library == measurement.library && workload == measurement.workload
         }) else {

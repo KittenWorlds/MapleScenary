@@ -148,9 +148,9 @@ cargo bench --bench roundtrip -- --save-baseline benches/baseline/ubuntu-latest.
 cargo bench --bench roundtrip -- --baseline benches/baseline/ubuntu-latest.json --threshold 30
 ```
 
-`--baseline` 按 `(library, workload)` 对比中位数：延迟涨幅或吞吐跌幅超过 `--threshold` 百分比就以非零状态退出；基线文件不存在时只提示并跳过，方便首次接入。任何 benchmark 失败或 panic 都会记录到 JSON 的 `failures` 并使进程失败，不会静默丢样本。
+`--baseline` 按 `(library, workload)` 对比中位数：延迟涨幅或吞吐跌幅超过 `--threshold` 百分比就以非零状态退出（只对我们自己的 `maple-scenary*` 系列生效，竞品数字仅供参考）；基线文件不存在时只提示并跳过，方便首次接入。任何 benchmark 失败或 panic 都会记录到 JSON 的 `failures` 并使进程失败，不会静默丢样本。
 
-CI 在 Ubuntu / macOS / Windows 三个 runner 上分别执行基准、与 `benches/baseline/<runner>.json` 对比并上传 JSON。`bench-chart` job 只在三平台数据齐全、无 failure 时生成 `latency.png`、`throughput.png` 和 `summary.md`（`benchmark-report` artifact），并在 PR 中创建或更新对比评论；缺任一平台会直接失败而不是发半张表。不同 runner 硬件不同，横向比较请只在同一行内看各库优劣，不要跨平台比绝对值。
+CI 在 Ubuntu / macOS / Windows 三个 runner 上分别执行基准（5 次取中位数）、与 `benches/baseline/<runner>.json` 对比并上传 JSON。`bench-chart` job 只在三平台数据齐全、无 failure 时生成 `latency.png`、`throughput.png` 和 `summary.md`（`benchmark-report` artifact），并在 PR 中创建或更新对比评论；缺任一平台会直接失败而不是发半张表。不同 runner 硬件不同，横向比较请只在同一行内看各库优劣，不要跨平台比绝对值。
 
 ## C ABI
 
@@ -189,8 +189,10 @@ src/
   sys/windows.rs 命名管道 + 命名 file mapping
 include/maple_scenary.h
 benches/roundtrip.rs
+benches/baseline/  三平台性能基线（CI 回归门槛）
 scripts/bench_chart.py
 tests/integration.rs
+TODO.md
 ```
 
 ## 状态

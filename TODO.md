@@ -19,7 +19,7 @@
 - [x] 事件循环接入：提供 `as_raw_fd` / Windows `HANDLE` 或 `pollable()`，让宿主把 doorbell 挂进自己的消息循环，替代 20µs→1ms 忙等（`Channel`/`Sender`/`Receiver::event_handle()`）
 - [x] 给出非阻塞 + Watcher 风格 API（可读/可写/对端关闭/配额超限），哪怕只做最小信号集（`Watcher::wait/try_wait` 返回 `Ready::{Readable, Closed, Timeout}`，非破坏性探测）
 - [ ] 端点传递：支持把一条 `Channel` 的端点作为消息内容交给第三方进程，先不做路由，只做「转发一次」
-- [ ] 共享内存句柄对用户可见：duplicate / 只读视图 / 按 offset 局部映射——渲染帧和纹理共享绕不开
+- [x] 共享内存句柄对用户可见：duplicate / 只读视图 / 按 offset 局部映射——渲染帧和纹理共享绕不开（`shared_region()` / `duplicate()` / `map_read_only()`）
 - [ ] 一对多/多对一：评估「一个 `Listener` 服务多个 page 进程」的连接表，而不是每页一条独立 socket + shm
 - [ ] `ChannelStats` 扩成可查询的队列水位（消息数 / 字节数 / 归还环积压）
 

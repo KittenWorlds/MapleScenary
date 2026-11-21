@@ -988,6 +988,70 @@ impl ShmHandle {
     pub(crate) fn name(&self) -> &str {
         ""
     }
+
+    /// Duplicate the descriptor so the region can outlive the handshake.
+    pub(crate) fn source(&self) -> Result<ShmSource> {
+        let fd = self
+            .fd
+            .try_clone()
+            .map_err(|error| Error::io("dup shared-memory fd", error))?;
+        Ok(ShmSource { fd })
+    }
+}
+
+/// A durable reference to the shared-memory object behind a channel.
+pub(crate) struct ShmSource {
+    fd: OwnedFd,
+}
+
+impl ShmSource {
+    /// Duplicate the file descriptor for use by another thread or process.
+    pub(crate) fn duplicate(&self) -> Result<OwnedFd> {
+        self.fd
+            .try_clone()
+            .map_err(|error| Error::io("dup shared-memory fd", error))
+    }
+
+    /// Map `[offset, offset + len)` read-only.
+    ///
+    /// `mmap` requires a page-aligned file offset, so the mapping is widened to
+    /// the enclosing pages. The returned delta is the distance from the mapping
+    /// base to the requested offset.
+    pub(crate) fn map_read_only(&self, offset: usize, len: usize) -> Result<(Map, usize)> {
+        let page = page_size();
+        let aligned = offset & !(page - 1);
+        let delta = offset - aligned;
+        let map_len = (delta + len).div_ceil(page) * page;
+        // SAFETY: `fd` is a shared-memory descriptor of at least `offset + len`
+        // bytes and `aligned` is page aligned.
+        let ptr = unsafe {
+            libc::mmap(
+                ptr::null_mut(),
+                map_len,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                self.fd.as_raw_fd(),
+                aligned as libc::off_t,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return Err(os_error("mmap"));
+        }
+        Ok((
+            Map {
+                // SAFETY: `mmap` returned a non-null pointer distinct from MAP_FAILED.
+                ptr: unsafe { std::ptr::NonNull::new_unchecked(ptr.cast::<u8>()) },
+                len: map_len,
+            },
+            delta,
+        ))
+    }
+}
+
+fn page_size() -> usize {
+    // SAFETY: `sysconf` has no side effects here and is thread-safe.
+    let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if size > 0 { size as usize } else { 4096 }
 }
 
 /// A mapped shared-memory region.
@@ -1008,6 +1072,16 @@ impl Map {
 
     pub(crate) fn len(&self) -> usize {
         self.len
+    }
+
+    /// Read-only slice inside the mapping.
+    pub(crate) fn slice(&self, offset: usize, len: usize) -> &[u8] {
+        assert!(
+            offset.checked_add(len).is_some_and(|end| end <= self.len),
+            "shared-memory view out of bounds"
+        );
+        // SAFETY: bounds checked above; the mapping lives as long as `&self`.
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr().add(offset), len) }
     }
 }
 
@@ -1121,6 +1195,8 @@ impl FdGuard {
     }
 }
 
-pub(crate) fn attach_shm(handle: ShmHandle, len: usize) -> Result<Map> {
-    map_fd(handle.fd.as_raw_fd(), len)
+pub(crate) fn attach_shm(handle: ShmHandle, len: usize) -> Result<(Map, ShmSource)> {
+    let source = handle.source()?;
+    let map = map_fd(handle.fd.as_raw_fd(), len)?;
+    Ok((map, source))
 }

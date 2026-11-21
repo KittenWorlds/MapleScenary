@@ -66,6 +66,23 @@ assert_eq!(message.bytes(), b"ping");
 
 窗口内的页面往往直接写布局缓冲，这正是 `reserve` 存在的理由：一次映射、一次发布，没有中间 `Vec` 拷贝。
 
+## 共享内存视图
+
+渲染帧和纹理上传需要拿到区域本身，而不只是 `send`/`recv`：
+
+```rust
+let region = client.shared_region().expect("shared-memory channel");
+let handle = region.duplicate()?; // Unix: OwnedFd；Windows: 命名 mapping handle
+let view = region.map_read_only(16, 4096)?; // 任意 offset，内部按页 / 64 KiB 对齐
+let bytes = view.as_slice();
+# let _ = (handle, bytes);
+```
+
+- `shared_region()` 在 stream 回退模式下返回 `None`。
+- `duplicate()` 交出独立的 OS 句柄：Unix 用 `into_fd()` 取得 `OwnedFd`，Windows 用 `into_handle()` 或 `name()`（`Local\...`）在子进程里 `OpenFileMappingW`。
+- `map_read_only(offset, len)` 接受非对齐 offset，返回的 `RegionView` 只暴露请求的字节；越界或零长度返回 `InvalidConfig`。
+- 视图不参与通道的发布协议：只应读取对端已经 `publish` 完成的数据。
+
 Typed 通道：
 
 ```toml
@@ -209,6 +226,7 @@ src/
   buddy.rs      进程本地 buddy 分配器
   ring.rs       SPSC 消息环 / 归还环
   region.rs     映射区域视图
+  shared.rs     用户可见的共享内存句柄与只读视图
   protocol.rs   Hello / Welcome 编解码
   typed.rs      serde typed 门面（feature）
   ffi.rs        C ABI

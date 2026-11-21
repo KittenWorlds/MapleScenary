@@ -191,6 +191,10 @@ cargo check --target aarch64-apple-darwin
 cargo check --target aarch64-linux-android
 ```
 
+## CI
+
+GitHub Actions 包含：`lint`（fmt、两套 feature 的 clippy、`RUSTDOCFLAGS=-D warnings` 的文档构建）、`test`（三平台，all-features 与默认 feature 各一轮）、`msrv 1.90`、`audit`（`cargo audit`）、`android`（`aarch64` / `x86_64` 两个 target 的 check）、`package`（`cargo package` 打包校验）、`coverage`（llvm-cov，上传 `lcov.info`）、三平台 `benchmark` 与 `bench-chart`，以及 tag（`v*`）触发的 `release`（release 构建并上传 cdylib / staticlib / rlib）。`ci-success` 汇总全部 job，分支保护只需勾选这一个必选检查。
+
 ## 基准测试
 
 `benches/roundtrip.rs` 测量 64 B 往返延迟与 64 KiB 吞吐，覆盖五组口径：

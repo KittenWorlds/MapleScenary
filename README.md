@@ -66,6 +66,23 @@ assert_eq!(message.bytes(), b"ping");
 
 窗口内的页面往往直接写布局缓冲，这正是 `reserve` 存在的理由：一次映射、一次发布，没有中间 `Vec` 拷贝。
 
+## 共享内存视图
+
+渲染帧和纹理上传需要拿到区域本身，而不只是 `send`/`recv`：
+
+```rust
+let region = client.shared_region().expect("shared-memory channel");
+let handle = region.duplicate()?; // Unix: OwnedFd；Windows: 命名 mapping handle
+let view = region.map_read_only(16, 4096)?; // 任意 offset，内部按页 / 64 KiB 对齐
+let bytes = view.as_slice();
+# let _ = (handle, bytes);
+```
+
+- `shared_region()` 在 stream 回退模式下返回 `None`。
+- `duplicate()` 交出独立的 OS 句柄：Unix 用 `into_fd()` 取得 `OwnedFd`，Windows 用 `into_handle()` 或 `name()`（`Local\...`）在子进程里 `OpenFileMappingW`。
+- `map_read_only(offset, len)` 接受非对齐 offset，返回的 `RegionView` 只暴露请求的字节；越界或零长度返回 `InvalidConfig`。
+- 视图不参与通道的发布协议：只应读取对端已经 `publish` 完成的数据。
+
 Typed 通道：
 
 ```toml
@@ -175,7 +192,7 @@ cargo bench --bench roundtrip -- --save-baseline benches/baseline/ubuntu-latest.
 cargo bench --bench roundtrip -- --baseline benches/baseline/ubuntu-latest.json --threshold 30
 ```
 
-`--baseline` 按 `(library, workload)` 对比中位数：延迟涨幅超过 `--threshold`、或吞吐跌幅超过 `--throughput-threshold`（默认 70%）就以非零状态退出。共享 runner 的绝对性能波动大，CI 用较宽的阈值（延迟 100%、吞吐 70%），并额外执行一条与硬件无关的硬约束：同一 runner 上 shm 路径吞吐必须 ≥ 2× `ipc-channel`、延迟必须 ≤ 2× `ipc-channel`。门禁只覆盖进程内路径；`2 proc` 系列只展示、不设绝对阈值（跨进程调度噪声太大）。基线文件不存在时只提示并跳过，方便首次接入。任何 benchmark 失败或 panic 都会记录到 JSON 的 `failures` 并使进程失败，不会静默丢样本。
+`--baseline` 按 `(library, workload)` 对比中位数：延迟涨幅超过 `--threshold`、或吞吐跌幅超过 `--throughput-threshold`（默认 70%）就以非零状态退出。共享 runner 的绝对性能波动大（Windows 上同一 workload 跨 run 见过 3.4× 的差异），CI 用较宽的阈值（延迟 100%、吞吐 80%）只兜底灾难性回退，真正阻断的是与硬件无关的 2× 竞品契约：同一 runner 上 shm 路径吞吐必须 ≥ 2× `ipc-channel`、延迟必须 ≤ 2× `ipc-channel`。门禁只覆盖进程内路径；`2 proc` 系列只展示、不设绝对阈值（跨进程调度噪声太大）。基线文件不存在时只提示并跳过，方便首次接入。任何 benchmark 失败或 panic 都会记录到 JSON 的 `failures` 并使进程失败，不会静默丢样本；CI 即使门禁失败也会上传原始 JSON 便于排查。
 
 CI 在 Ubuntu / macOS / Windows 三个 runner 上分别执行基准（5 次取中位数）、与 `benches/baseline/<runner>.json` 对比并上传 JSON。`bench-chart` job 只在三平台数据齐全、无 failure 时生成 `latency.png`、`throughput.png` 和 `summary.md`（`benchmark-report` artifact），并在 PR 中创建或更新对比评论；缺任一平台会直接失败而不是发半张表。不同 runner 硬件不同，横向比较请只在同一行内看各库优劣，不要跨平台比绝对值。
 
@@ -209,6 +226,7 @@ src/
   buddy.rs      进程本地 buddy 分配器
   ring.rs       SPSC 消息环 / 归还环
   region.rs     映射区域视图
+  shared.rs     用户可见的共享内存句柄与只读视图
   protocol.rs   Hello / Welcome 编解码
   typed.rs      serde typed 门面（feature）
   ffi.rs        C ABI

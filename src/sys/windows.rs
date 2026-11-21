@@ -6,6 +6,7 @@
 //! client opens the mapping with `OpenFileMappingW`.
 
 use std::cell::Cell;
+use std::os::windows::io::{FromRawHandle, OwnedHandle};
 use std::ptr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -22,8 +23,8 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows_sys::Win32::System::Memory::{
-    CreateFileMappingW, FILE_MAP_ALL_ACCESS, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
-    OpenFileMappingW, PAGE_READWRITE, UnmapViewOfFile,
+    CreateFileMappingW, FILE_MAP_ALL_ACCESS, FILE_MAP_READ, MEMORY_MAPPED_VIEW_ADDRESS,
+    MapViewOfFile, OpenFileMappingW, PAGE_READWRITE, UnmapViewOfFile,
 };
 use windows_sys::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE,
@@ -659,6 +660,82 @@ impl ShmHandle {
     pub(crate) fn name(&self) -> &str {
         &self.name
     }
+
+    /// Keep a reference to the object after the handshake.
+    pub(crate) fn source(&self) -> Result<ShmSource> {
+        Ok(ShmSource {
+            name: self.name.clone(),
+        })
+    }
+}
+
+/// A durable reference to the shared-memory object behind a channel.
+pub(crate) struct ShmSource {
+    name: String,
+}
+
+/// Windows allocation granularity; `MapViewOfFile` offsets must be a multiple.
+const VIEW_GRANULARITY: usize = 64 * 1024;
+
+impl ShmSource {
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Open a second mapping handle for use by another thread or process.
+    pub(crate) fn duplicate(&self) -> Result<OwnedHandle> {
+        let path = wide(&self.name);
+        // SAFETY: `path` is NUL-terminated and the object is alive.
+        let mapping = unsafe { OpenFileMappingW(FILE_MAP_ALL_ACCESS, 0, path.as_ptr()) };
+        if mapping == INVALID_HANDLE_VALUE || mapping.is_null() {
+            return Err(os_error("OpenFileMappingW", last_error()));
+        }
+        // SAFETY: the handle was just opened and is owned here.
+        Ok(unsafe { OwnedHandle::from_raw_handle(mapping) })
+    }
+
+    /// Map `[offset, offset + len)` read-only.
+    ///
+    /// `MapViewOfFile` requires an offset that is a multiple of the 64 KiB
+    /// allocation granularity, so the view is widened and the delta is returned.
+    pub(crate) fn map_read_only(&self, offset: usize, len: usize) -> Result<(Map, usize)> {
+        let aligned = offset & !(VIEW_GRANULARITY - 1);
+        let delta = offset - aligned;
+        let map_len = (delta + len).div_ceil(VIEW_GRANULARITY) * VIEW_GRANULARITY;
+        let path = wide(&self.name);
+        // SAFETY: `path` is NUL-terminated and the object is alive.
+        let mapping = unsafe { OpenFileMappingW(FILE_MAP_READ, 0, path.as_ptr()) };
+        if mapping == INVALID_HANDLE_VALUE || mapping.is_null() {
+            return Err(os_error("OpenFileMappingW", last_error()));
+        }
+        // SAFETY: read-only view at a granularity-aligned offset.
+        let view = unsafe {
+            MapViewOfFile(
+                mapping,
+                FILE_MAP_READ,
+                (aligned >> 32) as u32,
+                aligned as u32,
+                map_len,
+            )
+        };
+        if view.Value.is_null() {
+            let error = os_error("MapViewOfFile", last_error());
+            // SAFETY: the view was not created, so only the mapping is owned here.
+            unsafe {
+                CloseHandle(mapping);
+            }
+            return Err(error);
+        }
+        Ok((
+            Map {
+                // SAFETY: `MapViewOfFile` returned a non-null view.
+                ptr: unsafe { std::ptr::NonNull::new_unchecked(view.Value.cast::<u8>()) },
+                len: map_len,
+                mapping,
+            },
+            delta,
+        ))
+    }
 }
 
 /// A mapped shared-memory region.
@@ -679,6 +756,16 @@ impl Map {
 
     pub(crate) fn len(&self) -> usize {
         self.len
+    }
+
+    /// Read-only slice inside the mapping.
+    pub(crate) fn slice(&self, offset: usize, len: usize) -> &[u8] {
+        assert!(
+            offset.checked_add(len).is_some_and(|end| end <= self.len),
+            "shared-memory view out of bounds"
+        );
+        // SAFETY: bounds checked above; the mapping lives as long as `&self`.
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr().add(offset), len) }
     }
 }
 
@@ -748,7 +835,7 @@ pub(crate) fn create_shm(len: usize) -> Result<(Map, ShmHandle)> {
     }
 }
 
-pub(crate) fn attach_named_shm(name: &str, len: usize) -> Result<Map> {
+pub(crate) fn attach_named_shm(name: &str, len: usize) -> Result<(Map, ShmSource)> {
     if name.is_empty() {
         return Err(Error::protocol("peer did not provide a shared-memory name"));
     }
@@ -759,7 +846,12 @@ pub(crate) fn attach_named_shm(name: &str, len: usize) -> Result<Map> {
         return Err(os_error("OpenFileMappingW", last_error()));
     }
     match map_view(mapping, len) {
-        Ok(map) => Ok(map),
+        Ok(map) => Ok((
+            map,
+            ShmSource {
+                name: name.to_owned(),
+            },
+        )),
         Err(error) => {
             // SAFETY: the mapping handle is owned here and was not stored.
             unsafe {

@@ -61,12 +61,13 @@ jobs:
           --repeats 5
           --baseline "benches/baseline/${{ matrix.os }}.json"
           --threshold 100
-          --throughput-threshold 70
+          --throughput-threshold 80
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: bench-${{ matrix.os }}
           path: bench-results/*.json
-          if-no-files-found: error
+          if-no-files-found: warn
 
   bench-chart:
     name: benchmark report

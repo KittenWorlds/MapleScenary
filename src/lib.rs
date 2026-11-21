@@ -61,6 +61,7 @@ mod layout;
 mod protocol;
 mod region;
 mod ring;
+mod shared;
 mod sys;
 
 pub mod channel;
@@ -78,5 +79,6 @@ pub use config::Config;
 pub use error::{Error, ErrorKind, Result};
 pub use listener::Listener;
 pub use protocol::Mode;
+pub use shared::{RegionView, SharedHandle, SharedRegion};
 #[cfg(feature = "typed")]
 pub use typed::{TypedChannel, TypedReceiver, TypedSender};

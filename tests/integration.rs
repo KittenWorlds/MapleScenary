@@ -212,6 +212,53 @@ fn typed_try_recv_is_non_blocking() {
 }
 
 #[test]
+fn shared_region_exposes_read_only_views() {
+    let (client, _server) = pair(compact()).expect("pair");
+    let region = client.shared_region().expect("shared-memory channel");
+    assert!(region.len() > 4096);
+
+    let header = region.map_read_only(0, 8).expect("map header");
+    assert_eq!(header.as_slice(), b"MPLSHM01");
+
+    // Unaligned offsets are widened to the enclosing page internally.
+    let misaligned = region.map_read_only(3, 5).expect("unaligned view");
+    assert_eq!(misaligned.as_slice(), &b"MPLSHM01"[3..8]);
+
+    let error = region
+        .map_read_only(region.len() - 1, 2)
+        .expect_err("out of bounds");
+    assert_eq!(error.kind(), ErrorKind::InvalidConfig);
+    assert!(region.map_read_only(0, 0).is_err());
+}
+
+#[test]
+fn shared_region_duplicate_is_a_live_handle() {
+    let (client, _server) = pair(compact()).expect("pair");
+    let region = client.shared_region().expect("shared-memory channel");
+    let handle = region.duplicate().expect("duplicate");
+    #[cfg(unix)]
+    {
+        assert!(handle.as_raw_fd() >= 0);
+        let _fd = handle.into_fd();
+    }
+    #[cfg(windows)]
+    {
+        assert!(!handle.as_raw_handle().is_null());
+        assert!(handle.name().starts_with("Local\\"));
+        let _handle = handle.into_handle();
+    }
+}
+
+#[test]
+fn stream_fallback_has_no_shared_region() {
+    let mut config = compact();
+    config.force_stream = true;
+    let (client, server) = pair(config).expect("pair");
+    assert!(client.shared_region().is_none());
+    assert!(server.shared_region().is_none());
+}
+
+#[test]
 fn event_handle_is_live() {
     let (client, _server) = pair(compact()).expect("pair");
     #[cfg(unix)]

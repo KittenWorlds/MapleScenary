@@ -3,15 +3,25 @@
 use std::sync::Arc;
 
 use crate::layout::Header;
-use crate::sys::Map;
+use crate::sys::{Map, ShmSource};
 
 pub(crate) struct Region {
     map: Map,
+    /// Kept so callers can duplicate the object or map extra read-only views.
+    source: ShmSource,
 }
 
 impl Region {
-    pub(crate) fn new(map: Map) -> Arc<Self> {
-        Arc::new(Self { map })
+    pub(crate) fn new(map: Map, source: ShmSource) -> Arc<Self> {
+        Arc::new(Self { map, source })
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    pub(crate) fn source(&self) -> &ShmSource {
+        &self.source
     }
 
     pub(crate) fn header(&self) -> &Header {

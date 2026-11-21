@@ -13,6 +13,7 @@ use crate::layout::{Header, Layout, Slot, initialize_header};
 use crate::protocol::{Hello, Mode, Welcome, status};
 use crate::region::Region;
 use crate::ring::{self, RingSpec};
+use crate::shared::SharedRegion;
 use crate::sys::{self, ShmHandle, Stream};
 
 /// Wire/build ABI revision advertised during the handshake.
@@ -798,6 +799,15 @@ impl Sender {
         self.transport.is_closed()
     }
 
+    /// The shared-memory region behind this channel, if the data plane is not
+    /// the stream fallback.
+    pub fn shared_region(&self) -> Option<SharedRegion> {
+        match &self.backend {
+            SenderBackend::Shm(sender) => Some(SharedRegion::new(sender.region.clone())),
+            SenderBackend::Stream => None,
+        }
+    }
+
     /// Current counters.
     pub fn stats(&self) -> ChannelStats {
         self.stats.snapshot()
@@ -825,6 +835,15 @@ impl Receiver {
     /// Borrow this half as a [`Watcher`] to integrate with an event loop.
     pub fn watcher(&self) -> Watcher<'_> {
         Watcher { receiver: self }
+    }
+
+    /// The shared-memory region behind this channel, if the data plane is not
+    /// the stream fallback.
+    pub fn shared_region(&self) -> Option<SharedRegion> {
+        match &self.backend {
+            ReceiverBackend::Shm(receiver) => Some(SharedRegion::new(receiver.region.clone())),
+            ReceiverBackend::Stream { .. } => None,
+        }
     }
 
     /// Non-destructive readiness probe. For shared memory this inspects ring
@@ -1308,6 +1327,12 @@ impl Channel {
         self.receiver.watcher()
     }
 
+    /// The shared-memory region behind this channel, if the data plane is not
+    /// the stream fallback.
+    pub fn shared_region(&self) -> Option<SharedRegion> {
+        self.sender.shared_region()
+    }
+
     /// Close both directions. Idempotent.
     pub fn close(&self) {
         self.sender.close();
@@ -1412,8 +1437,9 @@ pub fn connect(name: &str, config: Config) -> Result<Channel> {
                     welcome.max_message, config.max_message_len
                 )));
             }
-            let map = sys::attach_shm(handle, &welcome.region_name, welcome.region_len as usize)?;
-            build_shm(Side::Client, Region::new(map), stream)
+            let (map, source) =
+                sys::attach_shm(handle, &welcome.region_name, welcome.region_len as usize)?;
+            build_shm(Side::Client, Region::new(map, source), stream)
         }
         Mode::Stream => {
             if welcome.max_message == 0 {
@@ -1466,11 +1492,12 @@ pub(crate) fn accept_stream(
         && !hello.prefer_stream
         && let Ok(layout) = Layout::new(config)
         && let Ok((map, shm_handle)) = sys::create_shm(config.region_len)
+        && let Ok(source) = shm_handle.source()
     {
         // SAFETY: the mapping is private to this process until the handshake
         // publishes it, and it is large enough for the header.
         unsafe { initialize_header(map.as_ptr(), &layout, ABI_VERSION) };
-        region = Some(Region::new(map));
+        region = Some(Region::new(map, source));
         handle = Some(shm_handle);
     }
 
@@ -1499,12 +1526,13 @@ pub fn pair(config: Config) -> Result<(Channel, Channel)> {
     config.validate()?;
     if !config.force_stream
         && let Ok((map, handle)) = sys::create_shm(config.region_len)
+        && let Ok(source) = handle.source()
     {
         drop(handle);
         let layout = Layout::new(&config)?;
         // SAFETY: the region is local until both channels are built.
         unsafe { initialize_header(map.as_ptr(), &layout, ABI_VERSION) };
-        let region = Region::new(map);
+        let region = Region::new(map, source);
         let (first, second) = sys::socket_pair(!config.force_stream)?;
         let client = build_shm(Side::Client, region.clone(), first)?;
         let server = build_shm(Side::Server, region, second)?;

@@ -1,4 +1,6 @@
 /target
 /Cargo.lock
 Cargo.lock.bak
+/bench-results
+/bench-report
 *.sock

@@ -126,6 +126,17 @@ cargo check --target aarch64-apple-darwin
 cargo check --target aarch64-linux-android
 ```
 
+## 基准测试
+
+`benches/roundtrip.rs` 测量 64 B 往返延迟与 64 KiB 吞吐，同时跑 MapleScenary（seqpacket/shm 与 stream 回退两种数据面）和同品类竞品 [`ipc-channel`](https://crates.io/crates/ipc-channel)（LavaCat 目前使用的库，按 `Vec<u8>` 收发，含序列化成本）：
+
+```bash
+cargo bench --bench roundtrip
+cargo bench --bench roundtrip -- --json bench-results/linux.json
+```
+
+CI 在 Ubuntu / macOS / Windows 三个 runner 上分别执行基准并上传 JSON；`bench-chart` job 用 `scripts/bench_chart.py` 汇总生成 `latency.png`、`throughput.png` 和 `summary.md`（`benchmark-report` artifact），并在 PR 中创建或更新对比评论。不同平台的 runner 硬件不同，横向比较请只在同一行内看各库优劣，不要跨平台比绝对值。
+
 ## C ABI
 
 ```c
@@ -163,6 +174,7 @@ src/
   sys/windows.rs 命名管道 + 命名 file mapping
 include/maple_scenary.h
 benches/roundtrip.rs
+scripts/bench_chart.py
 tests/integration.rs
 ```
 

@@ -25,6 +25,8 @@ bincode = { version = "2", optional = true, default-features = false, features =
 
 [dev-dependencies]
 serde = { version = "1", features = ["derive"] }
+# Competitor used by the benchmark harness (same category: cross-process IPC).
+ipc-channel = "0.23"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

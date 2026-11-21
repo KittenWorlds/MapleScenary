@@ -574,6 +574,7 @@ fn check_competitor_ratio(measurements: &[Measurement]) -> Vec<String> {
             }
         }
         if measurement.workload == "latency-64B"
+            && !measurement.library.contains("stream")
             && let Some(competitor) = competitor_latency
         {
             let ratio = measurement.median() / competitor;

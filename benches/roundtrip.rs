@@ -498,8 +498,12 @@ fn check_regressions(
 ) -> Vec<String> {
     let mut regressions = Vec::new();
     for measurement in measurements {
-        // Only gate our own paths: competitor numbers are informational.
-        if !measurement.library.starts_with("maple-scenary") {
+        // Only gate our own in-process paths: competitor numbers are
+        // informational, and cross-process scheduling on shared runners is too
+        // noisy for an absolute threshold.
+        if !measurement.library.starts_with("maple-scenary")
+            || measurement.library.contains("2 proc")
+        {
             continue;
         }
         let Some((_, _, base, _)) = baseline.iter().find(|(library, workload, _, _)| {
@@ -532,34 +536,53 @@ fn check_regressions(
 }
 
 /// Hardware-independent contract: on the same runner the shared-memory path
-/// must stay at least this many times faster than `ipc-channel`.
+/// must stay at least this many times faster than `ipc-channel`, and its
+/// latency must stay within this factor of the competitor.
 const MIN_THROUGHPUT_RATIO: f64 = 2.0;
+const MAX_LATENCY_RATIO: f64 = 2.0;
 
 fn check_competitor_ratio(measurements: &[Measurement]) -> Vec<String> {
-    let Some(competitor) = measurements
+    let competitor_throughput = measurements
         .iter()
         .find(|measurement| {
             measurement.library == "ipc-channel" && measurement.workload == "throughput-64KiB"
         })
-        .map(Measurement::median)
-    else {
-        return Vec::new();
-    };
+        .map(Measurement::median);
+    let competitor_latency = measurements
+        .iter()
+        .find(|measurement| {
+            measurement.library == "ipc-channel" && measurement.workload == "latency-64B"
+        })
+        .map(Measurement::median);
     let mut failures = Vec::new();
     for measurement in measurements {
-        if measurement.workload != "throughput-64KiB"
-            || !measurement.library.starts_with("maple-scenary")
-            || measurement.library.contains("stream")
+        if !measurement.library.starts_with("maple-scenary")
             || measurement.library.contains("2 proc")
         {
             continue;
         }
-        let ratio = measurement.median() / competitor;
-        if ratio < MIN_THROUGHPUT_RATIO {
-            failures.push(format!(
-                "{} throughput is only {:.2}x ipc-channel (minimum {MIN_THROUGHPUT_RATIO:.1}x)",
-                measurement.library, ratio
-            ));
+        if measurement.workload == "throughput-64KiB"
+            && !measurement.library.contains("stream")
+            && let Some(competitor) = competitor_throughput
+        {
+            let ratio = measurement.median() / competitor;
+            if ratio < MIN_THROUGHPUT_RATIO {
+                failures.push(format!(
+                    "{} throughput is only {:.2}x ipc-channel (minimum {MIN_THROUGHPUT_RATIO:.1}x)",
+                    measurement.library, ratio
+                ));
+            }
+        }
+        if measurement.workload == "latency-64B"
+            && let Some(competitor) = competitor_latency
+        {
+            let ratio = measurement.median() / competitor;
+            if ratio > MAX_LATENCY_RATIO {
+                failures.push(format!(
+                    "{} latency is {:.2}x ipc-channel (maximum {MAX_LATENCY_RATIO:.1}x)",
+                    measurement.library, ratio
+                ));
+            }
         }
     }
     failures

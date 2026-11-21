@@ -35,6 +35,22 @@ fn empty_payload_roundtrip() {
 }
 
 #[test]
+fn batched_send_rings_once() {
+    let (client, server) = pair(compact()).expect("pair");
+    let payloads: Vec<Vec<u8>> = (0..16u8).map(|index| vec![index; 32]).collect();
+    let refs: Vec<&[u8]> = payloads.iter().map(Vec::as_slice).collect();
+    let sent = client.send_many(11, &refs).expect("send_many");
+    assert_eq!(sent, payloads.len());
+    assert_eq!(client.stats().wakeups_sent, 1);
+    for (index, payload) in payloads.iter().enumerate() {
+        let message = server.recv(WAIT).expect("recv");
+        assert_eq!(message.kind(), 11);
+        assert_eq!(message.bytes(), payload.as_slice());
+        assert_eq!(message.bytes()[0] as usize, index);
+    }
+}
+
+#[test]
 fn zero_copy_reservation() {
     let (client, server) = pair(compact()).expect("pair");
     let mut outgoing = client.reserve(4096).expect("reserve");

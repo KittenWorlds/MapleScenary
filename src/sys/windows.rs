@@ -426,6 +426,19 @@ impl Stream {
         Ok(())
     }
 
+    /// Named pipes are always byte-mode here, so a prefix and payload are just
+    /// two sequential writes.
+    pub(crate) fn send_vectored(
+        &self,
+        prefix: &[u8],
+        payload: &[u8],
+        timeout: Option<Duration>,
+    ) -> Result<()> {
+        let deadline = timeout.map(|timeout| Instant::now() + timeout);
+        self.send_all(prefix, remaining(deadline))?;
+        self.send_all(payload, remaining(deadline))
+    }
+
     pub(crate) fn wake(&self) -> Result<()> {
         match self.write_once(&[1u8], Some(Duration::from_millis(1))) {
             Ok(_) => Ok(()),

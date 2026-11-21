@@ -25,8 +25,8 @@
 
 ## P2 健壮性与不可信边界（沙箱化前提）
 
-- [ ] 崩溃长稳测试：对端在 `reserve` / `publish` / `Drop` 各阶段被 kill，验证归还环残留与块泄漏
-- [ ] 补 seq 回绕、ring 满、畸形描述符 fuzz；现在只有 12 个 happy-path 集成测试
+- [x] 崩溃长稳测试：对端在 `reserve` / `publish` / `Drop` 各阶段被 kill，验证归还环残留与块泄漏（`crash_peer_shared_memory` / `crash_peer_stream_fallback`：子进程直接 `exit`，已发布消息仍可读取，对端关闭可观测且不阻塞）
+- [x] 补 seq 回绕、ring 满、畸形描述符用例（环位置跨 `u32` 回绕、满环拒绝、握手截断/坏 magic/坏 mode/超长名字、header 几何校验）
 - [ ] `Disconnected` 细分原因（进程终止 / 校验失败 / 主动关闭 / 超时），并保留残留消息排空语义
 - [ ] 配额与限速：单连接内存上限、消息速率上限，防止不可信 page 撑爆 64 MiB 区域
 - [ ] 权限模型最小版：endpoint 名字的访问控制，Windows `Local` 命名映射的 ACL 复核

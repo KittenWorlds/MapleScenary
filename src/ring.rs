@@ -124,3 +124,84 @@ pub(crate) fn pop_return(
     tail.store(position.wrapping_add(1), Ordering::Release);
     Some(entry)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sys::create_shm;
+
+    fn test_region() -> std::sync::Arc<Region> {
+        let (map, handle) = create_shm(64 * 1024).expect("shared memory");
+        Region::new(map, handle.source().expect("region source"))
+    }
+
+    #[test]
+    fn message_ring_wraps_and_reports_pending_bytes() {
+        let region = test_region();
+        let ring = RingSpec::new(0, 4);
+        // Start one slot before the u32 wrap so every index and the head/tail
+        // themselves have to wrap.
+        let start = u32::MAX - 1;
+        let head = AtomicU32::new(start);
+        let tail = AtomicU32::new(start);
+
+        for len in 1..=4u32 {
+            assert!(push_slot(
+                &region,
+                ring,
+                &head,
+                &tail,
+                &Slot::new(0, len, len, len)
+            ));
+        }
+        assert!(!push_slot(
+            &region,
+            ring,
+            &head,
+            &tail,
+            &Slot::new(0, 9, 9, 9)
+        ));
+
+        let head_now = head.load(Ordering::Relaxed);
+        let tail_now = tail.load(Ordering::Relaxed);
+        assert_eq!(head_now.wrapping_sub(tail_now), 4);
+        assert_eq!(pending_bytes(&region, ring, head_now, tail_now), 10);
+
+        for len in 1..=4u32 {
+            let slot = pop_slot(&region, ring, &head, &tail).expect("queued slot");
+            assert_eq!(slot.len, len);
+            assert_eq!(slot.kind, len);
+        }
+        assert!(pop_slot(&region, ring, &head, &tail).is_none());
+        assert_eq!(tail.load(Ordering::Relaxed), start.wrapping_add(4));
+    }
+
+    #[test]
+    fn return_ring_wraps() {
+        let region = test_region();
+        let ring = RingSpec::new(4096, 4);
+        let start = u32::MAX - 2;
+        let head = AtomicU32::new(start);
+        let tail = AtomicU32::new(start);
+
+        for offset in 0..4u32 {
+            assert!(push_return(&region, ring, &head, &tail, offset, 64));
+        }
+        assert!(!push_return(&region, ring, &head, &tail, 4, 64));
+
+        for offset in 0..4u32 {
+            let entry = pop_return(&region, ring, &head, &tail).expect("queued return");
+            assert_eq!(entry.offset, offset);
+            assert_eq!(entry.len, 64);
+        }
+        assert!(pop_return(&region, ring, &head, &tail).is_none());
+    }
+
+    #[test]
+    fn pending_bytes_is_bounded_by_capacity() {
+        let region = test_region();
+        let ring = RingSpec::new(0, 4);
+        // A bogus head/tail pair must not scan more than the ring capacity.
+        assert_eq!(pending_bytes(&region, ring, u32::MAX, 0), 0);
+    }
+}

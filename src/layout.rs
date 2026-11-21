@@ -284,3 +284,53 @@ pub(crate) unsafe fn initialize_header(base: *mut u8, layout: &Layout, abi_versi
     unsafe { std::ptr::write(base.cast::<Header>(), header) };
     std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sys::create_shm;
+
+    /// Build a real one-page-backed header, let `mutate` corrupt it, then run
+    /// the same validation the receiving process applies.
+    fn accepts(cfg: &Config, mutate: impl FnOnce(&mut Header)) -> bool {
+        let layout = Layout::new(cfg).expect("layout");
+        let (map, _handle) = create_shm(cfg.region_len).expect("shared memory");
+        let base = map.as_ptr();
+        // SAFETY: the mapping is private, long enough for the header and not
+        // shared with any other thread or process yet.
+        unsafe { initialize_header(base, &layout, 1) };
+        // SAFETY: same argument as above; the mapping outlives this borrow.
+        let header = unsafe { &mut *base.cast::<Header>() };
+        mutate(header);
+        Layout::from_header(header).is_ok()
+    }
+
+    #[test]
+    fn pristine_header_is_accepted() {
+        assert!(accepts(&Config::compact(), |_header| {}));
+    }
+
+    #[test]
+    fn rejects_corrupt_magic_and_version() {
+        assert!(!accepts(&Config::compact(), |header| header.magic[0] ^= 0xFF));
+        assert!(!accepts(&Config::compact(), |header| {
+            header.format_version = FORMAT_VERSION + 1;
+        }));
+    }
+
+    #[test]
+    fn rejects_inconsistent_geometry() {
+        assert!(!accepts(&Config::compact(), |header| header.ring_cap = 3));
+        assert!(!accepts(&Config::compact(), |header| header.ret_cap = 0));
+        assert!(!accepts(&Config::compact(), |header| header.min_unit = 3));
+        assert!(!accepts(&Config::compact(), |header| {
+            header.half_b_off = header.half_a_off;
+        }));
+        assert!(!accepts(&Config::compact(), |header| {
+            header.half_len = 0;
+        }));
+        assert!(!accepts(&Config::compact(), |header| {
+            header.max_message = header.half_len + 1;
+        }));
+    }
+}

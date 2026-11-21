@@ -1,0 +1,55 @@
+[package]
+name = "maple-scenary"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "LGPL-3.0-or-later"
+description = "Cross-platform IPC middleware: shared-memory message rings, zero-copy payloads and doorbell wakeups for LavaCat"
+repository = "https://github.com/KittenWorlds/MapleScenary"
+readme = "README.md"
+keywords = ["ipc", "shared-memory", "zero-copy", "browser"]
+categories = ["os", "network-programming"]
+
+[lib]
+name = "maple_scenary"
+crate-type = ["rlib", "cdylib", "staticlib"]
+
+[features]
+default = []
+# Serde-based typed channels (`maple_scenary::typed`).
+typed = ["dep:serde", "dep:bincode"]
+
+[dependencies]
+serde = { version = "1", optional = true, default-features = false, features = ["alloc"] }
+bincode = { version = "2", optional = true, default-features = false, features = ["std", "serde"] }
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31", default-features = false, features = [
+    "fs",
+    "mman",
+    "poll",
+    "socket",
+    "time",
+    "uio",
+] }
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Memory",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
+
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1
+
+[[bench]]
+name = "roundtrip"
+harness = false

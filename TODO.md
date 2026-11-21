@@ -5,14 +5,14 @@
 
 ## P0 收口现状（本周）
 
-- [ ] 合并 PR #2，把 bench-chart 的 `if: always()` 改成三平台 JSON 齐全才出表，避免数据缺失仍发评论
+- [x] 合并 PR #2，把 bench-chart 的 `if: always()` 改成三平台 JSON 齐全才出表，避免数据缺失仍发评论
 - [x] bench 加 `--save-baseline` / `--baseline` 与回归阈值，接入 CI 阻断（现在只是展示型，拦不住性能回退）
 - [x] bench 补重复次数与误差棒；`catch_unwind` 吞掉的 panic 要显式报错，不能静默跳过样本
 - [x] 让接收端真正消费 payload（拷贝或求和），修正「零拷贝环空转」虚高的吞吐数字
 - [x] 补一组 `Listener`/`connect` 真双进程 bench，和 `pair` 并列展示——现在测的是单进程上限
 - [x] 对比口径对齐：ipc-channel 改发 raw bytes 或注明含序列化，别混着比
 - [x] README 状态段同步实际进度（Windows 运行时已在 CI 跑通、bench 已有三平台数据），删掉「依赖 CI 验证」的旧表述
-- [ ] 补 GitHub About 描述 + topics，发第一个 Release / tag
+- [ ] 补 GitHub About 描述 + topics（集成 token 无 repo 管理权限，需手动在 Settings 填写：`Cross-platform IPC middleware: shared-memory message rings, zero-copy payloads and doorbell wakeups for LavaCat`，topics：`rust ipc shared-memory zero-copy cross-platform linux macos windows android browser`）；发第一个 Release / tag（v0.1.0 已发布）
 
 ## P1 能力缺口（决定能不能用）
 

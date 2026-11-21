@@ -14,6 +14,7 @@
 - **无跨进程锁的热路径**：区域按方向对半切分，每侧用进程本地 buddy 分配器；对端通过归还环（return ring）把块还回来，发送方在下次分配前回收。
 - **SPSC 环**：每个方向一条消息环（32 字节描述符）和一条归还环（8 字节），`AtomicU32` head/tail 使用 Acquire/Release。
 - **Doorbell 唤醒**：生产者仅在 `notified` 由 false 变 true 时写 1 字节；消费者清位后复查，避免丢唤醒。没有额外线程、eventfd 或信号。
+- **事件循环接入**：`event_handle()` 交出控制 socket 的 `RawFd`/`RawHandle`，`Watcher` 提供不消耗消息的等待原语。
 - **真实四平台实现**：不是条件编译占位。
 - **Stream 回退**：共享内存不可用或显式设置 `Config::force_stream` 时，退化为长度前缀帧，语义一致。
 - **可选 typed 通道**：`typed` feature 提供基于 `serde` + `bincode` 的 `TypedChannel<T>`。
@@ -94,6 +95,32 @@ assert_eq!(b.recv(None)?.width, 1280);
 - `Message` 借用共享内存；只要消息还活着，对应块不会被复用。`Drop` 后由发送方回收。
 - 关闭一侧的 `Channel` 会 shutdown 控制 socket，对端 `recv` 返回 `Disconnected`。
 - 共享内存布局校验（magic、版本、偏移、对齐、长度）在接收端执行，畸形描述符返回 `Protocol`/`Internal`。
+
+## 事件循环接入
+
+`recv` 会把调用线程停在门铃上。已经拥有消息循环的宿主（浏览器合成器、UI 框架、async runtime）不需要为 IPC 再开线程，可以直接等待：
+
+```rust
+use std::time::Duration;
+use maple_scenary::{pair, Config, Ready};
+
+let (client, server) = pair(Config::compact())?;
+let watcher = server.watcher();
+match watcher.wait(Some(Duration::from_millis(16)))? {
+    Ready::Readable => {
+        let message = server.try_recv()?.expect("readable implies a message");
+        assert_eq!(message.kind(), 1);
+    }
+    Ready::Closed => { /* 先排空 try_recv，再退出事件循环 */ }
+    Ready::Timeout => { /* 画下一帧 */ }
+}
+# Ok::<(), maple_scenary::Error>(())
+```
+
+- `Channel::event_handle()`、`Sender::event_handle()`、`Receiver::event_handle()` 返回控制 socket / 管道的 `RawFd`（Unix）或 `RawHandle`（Windows），可直接注册到 `epoll`、`kqueue` 或 overlapped I/O。句柄归 channel 所有：不要关闭，channel 释放前停止监听。
+- `Watcher::wait` 是非破坏性的：返回 `Ready::Readable` 后，消息仍然由 `try_recv` 取走；对端关闭前已发布的消息会先报 `Readable`，排空后才报 `Closed`。
+- `Watcher::try_wait()` 是零超时版本；超时返回 `Ready::Timeout` 而不是错误。
+- 共享内存模式等的是门铃字节；stream 回退改为等待 socket 可读，避免把帧首字节当作门铃吞掉。Windows 命名管道没有 `poll`，`Watcher` 在 stream 模式下退化为 1 ms `PeekNamedPipe` 轮询，共享内存模式仍走门铃。
 
 ## 布局
 

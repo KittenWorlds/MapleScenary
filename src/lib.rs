@@ -71,8 +71,8 @@ pub mod listener;
 pub mod typed;
 
 pub use channel::{
-    ABI_VERSION, Channel, ChannelStats, HANDSHAKE_TIMEOUT, Message, Outgoing, Receiver, Sender,
-    connect, pair,
+    ABI_VERSION, Channel, ChannelStats, EventHandle, HANDSHAKE_TIMEOUT, Message, Outgoing, Ready,
+    Receiver, Sender, Watcher, connect, pair,
 };
 pub use config::Config;
 pub use error::{Error, ErrorKind, Result};

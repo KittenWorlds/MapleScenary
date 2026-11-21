@@ -447,6 +447,61 @@ impl Stream {
         }
     }
 
+    /// Handle a host event loop can watch for doorbell activity.
+    ///
+    /// The handle stays owned by the channel: callers must not close it and
+    /// must stop watching it once the channel is dropped.
+    pub(crate) fn event_handle(&self) -> HANDLE {
+        self.handle
+    }
+
+    /// Wait until the pipe is readable without consuming a byte.
+    ///
+    /// Named pipes have no `poll`; `PeekNamedPipe` plus a short sleep is the
+    /// portable fallback. Shared-memory channels use the doorbell path instead
+    /// and never pay this latency.
+    pub(crate) fn wait_ready(&self, timeout: Option<Duration>) -> Result<()> {
+        let deadline = timeout.map(|timeout| Instant::now() + timeout);
+        loop {
+            if self.peek_ready()? {
+                return Ok(());
+            }
+            let left = remaining(deadline);
+            if matches!(left, Some(left) if left.is_zero()) {
+                return Err(timeout_error());
+            }
+            std::thread::sleep(
+                Duration::from_millis(1).min(left.unwrap_or(Duration::from_millis(1))),
+            );
+        }
+    }
+
+    /// Non-destructive readiness probe based on `PeekNamedPipe`.
+    pub(crate) fn peek_ready(&self) -> Result<bool> {
+        let mut available = 0u32;
+        // SAFETY: null data buffer asks only for the byte count.
+        let ok = unsafe {
+            PeekNamedPipe(
+                self.handle,
+                ptr::null_mut(),
+                0,
+                ptr::null_mut(),
+                &mut available,
+                ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            let code = last_error();
+            return match classify(code) {
+                ErrorKind::Disconnected => {
+                    Err(Error::new(ErrorKind::Disconnected, "peer closed the pipe"))
+                }
+                _ => Err(os_error("PeekNamedPipe", code)),
+            };
+        }
+        Ok(available > 0)
+    }
+
     pub(crate) fn wait_wake(&self, timeout: Option<Duration>) -> Result<()> {
         let mut byte = [0u8; 1];
         match self.read_once(&mut byte, timeout) {

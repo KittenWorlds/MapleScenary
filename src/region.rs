@@ -14,10 +14,6 @@ impl Region {
         Arc::new(Self { map })
     }
 
-    pub(crate) fn len(&self) -> usize {
-        self.map.len()
-    }
-
     pub(crate) fn header(&self) -> &Header {
         // SAFETY: every mapping is page aligned and at least `HEADER_SPACE`
         // bytes long; the header is only written during initialization, before
@@ -42,6 +38,7 @@ impl Region {
     /// # Safety
     /// The caller must own the block exclusively: no other thread or process
     /// may read or write these bytes until the returned borrow ends.
+    #[allow(clippy::mut_from_ref)]
     pub(crate) unsafe fn slice_mut(&self, offset: usize, len: usize) -> &mut [u8] {
         assert!(
             offset
@@ -63,15 +60,7 @@ impl Region {
         // SAFETY: bounds checked above; `data` cannot overlap the mapping
         // because callers pass owned buffers.
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                data.as_ptr(),
-                self.map.as_ptr().add(offset),
-                data.len(),
-            );
+            std::ptr::copy_nonoverlapping(data.as_ptr(), self.map.as_ptr().add(offset), data.len());
         }
-    }
-
-    pub(crate) fn read_copy(&self, offset: usize, len: usize) -> Vec<u8> {
-        self.slice(offset, len).to_vec()
     }
 }

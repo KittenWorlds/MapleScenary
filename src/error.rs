@@ -98,11 +98,14 @@ impl Error {
         self.os_code
     }
 
+    /// Attach a platform error code.
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub(crate) fn with_os_code(mut self, code: i32) -> Self {
         self.os_code = Some(code);
         self
     }
 
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn io(context: impl fmt::Display, err: io::Error) -> Self {
         let kind = match err.kind() {
             io::ErrorKind::PermissionDenied => ErrorKind::PermissionDenied,
@@ -117,9 +120,8 @@ impl Error {
             io::ErrorKind::Unsupported => ErrorKind::Unsupported,
             _ => ErrorKind::Io,
         };
-        let os_code = err.raw_os_error();
         let mut error = Self::new(kind, format!("{context}: {err}"));
-        error.os_code = os_code;
+        error.os_code = err.raw_os_error();
         error
     }
 }
@@ -137,27 +139,3 @@ impl std::error::Error for Error {}
 
 /// Convenience result alias.
 pub type Result<T> = std::result::Result<T, Error>;
-
-#[cfg(unix)]
-impl From<nix::errno::Errno> for Error {
-    fn from(err: nix::errno::Errno) -> Self {
-        use nix::errno::Errno;
-        let kind = match err {
-            Errno::EAGAIN | Errno::EWOULDBLOCK => ErrorKind::WouldBlock,
-            Errno::EINTR => ErrorKind::Io,
-            Errno::EPIPE | Errno::ECONNRESET | Errno::ENOTCONN => ErrorKind::Disconnected,
-            Errno::ETIMEDOUT => ErrorKind::Timeout,
-            Errno::EACCES | Errno::EPERM => ErrorKind::PermissionDenied,
-            Errno::EADDRINUSE => ErrorKind::AddrInUse,
-            Errno::EOPNOTSUPP | Errno::EPROTONOSUPPORT | Errno::ESOCKTNOSUPPORT => {
-                ErrorKind::Unsupported
-            }
-            _ => ErrorKind::Io,
-        };
-        Self {
-            kind,
-            message: format!("{err}"),
-            os_code: Some(err as i32),
-        }
-    }
-}

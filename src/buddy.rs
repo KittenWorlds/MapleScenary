@@ -164,6 +164,7 @@ impl Buddy {
     }
 
     /// Bytes covered by the arena.
+    #[cfg(test)]
     pub(crate) fn capacity(&self) -> usize {
         self.units as usize * self.min_unit as usize
     }
@@ -200,7 +201,7 @@ mod tests {
         let mut blocks = BTreeMap::new();
         let mut rng = Rng(0x1234_5678_9abc_def0);
         for _ in 0..20_000 {
-            if blocks.is_empty() || rng.next() % 2 == 0 {
+            if blocks.is_empty() || rng.next().is_multiple_of(2) {
                 let len = 1 + (rng.next() % 8192) as usize;
                 if let Some(offset) = buddy.alloc(len) {
                     assert_eq!(offset % 512, 0);
@@ -217,7 +218,10 @@ mod tests {
         for (offset, len) in blocks {
             buddy.free(offset, len);
         }
-        assert_eq!(buddy.alloc(buddy.capacity()), Some(4096));
+        // The arena is not a power-of-two number of units, so ask for half of it:
+        // after a full sweep the largest naturally aligned block starts at base.
+        let half = buddy.capacity() / 2;
+        assert_eq!(buddy.alloc(half), Some(4096));
     }
 
     #[test]

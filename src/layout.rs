@@ -148,10 +148,9 @@ impl Layout {
         let rb2a_off = ra2b_off + ret_cap as usize * RET_SLOT_LEN;
         let meta_len = align_up(rb2a_off + ret_cap as usize * RET_SLOT_LEN, 4096);
 
-        let available = cfg
-            .region_len
-            .checked_sub(meta_len)
-            .ok_or_else(|| Error::invalid_config("region_len is too small for the ring metadata"))?;
+        let available = cfg.region_len.checked_sub(meta_len).ok_or_else(|| {
+            Error::invalid_config("region_len is too small for the ring metadata")
+        })?;
         let half_len = (available / 2) & !(cfg.min_unit - 1);
         if half_len < cfg.min_unit * 2 {
             return Err(Error::invalid_config(
@@ -219,7 +218,9 @@ impl Layout {
             || !min_unit.is_power_of_two()
             || header.max_message as usize > half_len
         {
-            return Err(Error::protocol("shared-memory header is internally inconsistent"));
+            return Err(Error::protocol(
+                "shared-memory header is internally inconsistent",
+            ));
         }
 
         Ok(Self {

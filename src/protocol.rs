@@ -84,7 +84,6 @@ pub(crate) mod status {
     pub(crate) const VERSION: u16 = 1;
     pub(crate) const CONFIG: u16 = 2;
     pub(crate) const UNAVAILABLE: u16 = 3;
-    pub(crate) const INTERNAL: u16 = 4;
 }
 
 /// Listening-side answer.
@@ -164,9 +163,7 @@ impl Welcome {
             0 => Mode::SharedMemory,
             1 => Mode::Stream,
             other => {
-                return Err(Error::protocol(format!(
-                    "unknown transport mode {other}"
-                )));
+                return Err(Error::protocol(format!("unknown transport mode {other}")));
             }
         };
         reader.skip(3)?;

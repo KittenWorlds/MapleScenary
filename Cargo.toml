@@ -23,15 +23,10 @@ typed = ["dep:serde", "dep:bincode"]
 serde = { version = "1", optional = true, default-features = false, features = ["alloc"] }
 bincode = { version = "2", optional = true, default-features = false, features = ["std", "serde"] }
 
+[dev-dependencies]
+serde = { version = "1", features = ["derive"] }
+
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.31", default-features = false, features = [
-    "fs",
-    "mman",
-    "poll",
-    "socket",
-    "time",
-    "uio",
-] }
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]

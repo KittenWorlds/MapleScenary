@@ -2,7 +2,7 @@
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use crate::layout::{RET_SLOT_LEN, SLOT_LEN, RetSlot, Slot};
+use crate::layout::{RET_SLOT_LEN, RetSlot, SLOT_LEN, Slot};
 use crate::region::Region;
 
 /// Location and capacity of one ring.
@@ -40,9 +40,7 @@ pub(crate) fn push_slot(
     }
     let offset = ring.offset + ring.index(position) * SLOT_LEN;
     // SAFETY: `slot` is a plain-old-data value with the exact slot layout.
-    let bytes = unsafe {
-        std::slice::from_raw_parts((slot as *const Slot).cast::<u8>(), SLOT_LEN)
-    };
+    let bytes = unsafe { std::slice::from_raw_parts((slot as *const Slot).cast::<u8>(), SLOT_LEN) };
     region.write(offset, bytes);
     head.store(position.wrapping_add(1), Ordering::Release);
     true
@@ -106,4 +104,3 @@ pub(crate) fn pop_return(
     tail.store(position.wrapping_add(1), Ordering::Release);
     Some(entry)
 }
-

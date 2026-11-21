@@ -6,18 +6,14 @@ mod unix;
 mod windows;
 
 #[cfg(unix)]
-pub(crate) use unix::{Listener, Map, ShmHandle, Stream, StreamKind, create_shm, socket_pair};
+pub(crate) use unix::{Listener, Map, ShmHandle, Stream, connect, create_shm, socket_pair};
 #[cfg(windows)]
-pub(crate) use windows::{Listener, Map, ShmHandle, Stream, StreamKind, create_shm, socket_pair};
+pub(crate) use windows::{Listener, Map, ShmHandle, Stream, connect, create_shm, socket_pair};
 
 use crate::error::Result;
 
 /// Map a peer-provided shared-memory handle (or name) into this process.
-pub(crate) fn attach_shm(
-    handle: Option<ShmHandle>,
-    name: &str,
-    len: usize,
-) -> Result<Map> {
+pub(crate) fn attach_shm(handle: Option<ShmHandle>, name: &str, len: usize) -> Result<Map> {
     #[cfg(unix)]
     {
         let _ = name;

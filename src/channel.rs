@@ -17,9 +17,13 @@ use crate::sys::{self, ShmHandle, Stream};
 
 /// Wire/build ABI revision advertised during the handshake.
 pub const ABI_VERSION: u32 = 1;
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Default wait used while the control handshake is in flight.
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_SEND_TIMEOUT: Duration = Duration::from_secs(30);
 const STREAM_CHUNK: usize = 64 * 1024;
+/// Largest slice handed to a single socket write; keeps message-mode sockets
+/// below their datagram limit when the channel fell back to stream framing.
+const STREAM_WRITE_CHUNK: usize = 32 * 1024;
 
 /// Snapshot of channel counters, useful for benchmarks and diagnostics.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -110,32 +114,32 @@ impl Side {
         }
     }
 
-    fn send_ring_atomics<'a>(self, header: &'a Header) -> (&'a AtomicU32, &'a AtomicU32) {
+    fn send_ring_atomics(self, header: &Header) -> (&AtomicU32, &AtomicU32) {
         match self {
             Self::Client => (&header.a2b_head, &header.a2b_tail),
             Self::Server => (&header.b2a_head, &header.b2a_tail),
         }
     }
 
-    fn recv_ring_atomics<'a>(self, header: &'a Header) -> (&'a AtomicU32, &'a AtomicU32) {
+    fn recv_ring_atomics(self, header: &Header) -> (&AtomicU32, &AtomicU32) {
         self.peer().send_ring_atomics(header)
     }
 
-    fn return_atomics<'a>(self, header: &'a Header) -> (&'a AtomicU32, &'a AtomicU32) {
+    fn return_atomics(self, header: &Header) -> (&AtomicU32, &AtomicU32) {
         match self {
             Self::Client => (&header.ra2b_head, &header.ra2b_tail),
             Self::Server => (&header.rb2a_head, &header.rb2a_tail),
         }
     }
 
-    fn send_notified<'a>(self, header: &'a Header) -> &'a AtomicBool {
+    fn send_notified(self, header: &Header) -> &AtomicBool {
         match self {
             Self::Client => &header.a2b_notified,
             Self::Server => &header.b2a_notified,
         }
     }
 
-    fn recv_notified<'a>(self, header: &'a Header) -> &'a AtomicBool {
+    fn recv_notified(self, header: &Header) -> &AtomicBool {
         self.peer().send_notified(header)
     }
 }
@@ -143,15 +147,13 @@ impl Side {
 /// Control socket plus the selected data-plane mode.
 struct Transport {
     stream: Stream,
-    mode: Mode,
     closed: AtomicBool,
 }
 
 impl Transport {
-    fn new(stream: Stream, mode: Mode) -> Self {
+    fn new(stream: Stream) -> Self {
         Self {
             stream,
-            mode,
             closed: AtomicBool::new(false),
         }
     }
@@ -179,10 +181,8 @@ impl Transport {
         match self.stream.wait_wake(timeout) {
             Ok(()) => Ok(()),
             Err(error) => {
-                if error.kind() == ErrorKind::Disconnected || error.kind() == ErrorKind::Timeout {
-                    if error.kind() == ErrorKind::Disconnected {
-                        self.closed.store(true, Ordering::Release);
-                    }
+                if error.kind() == ErrorKind::Disconnected {
+                    self.closed.store(true, Ordering::Release);
                 }
                 Err(error)
             }
@@ -198,9 +198,11 @@ impl Transport {
         header[0..4].copy_from_slice(&(payload.len() as u32).to_le_bytes());
         header[4..8].copy_from_slice(&kind.to_le_bytes());
         let result = (|| {
-            self.stream
-                .send_all(&header, remaining(deadline))?;
-            self.stream.send_all(payload, remaining(deadline))
+            self.stream.send_all(&header, remaining(deadline))?;
+            for chunk in payload.chunks(STREAM_WRITE_CHUNK) {
+                self.stream.send_all(chunk, remaining(deadline))?;
+            }
+            Ok(())
         })();
         if result.is_err() {
             // A partially written frame desynchronizes the peer, so fail closed.
@@ -216,7 +218,10 @@ impl Transport {
         match self.stream.read_some(buf, timeout) {
             Ok(0) => {
                 self.closed.store(true, Ordering::Release);
-                Err(Error::new(ErrorKind::Disconnected, "peer closed the channel"))
+                Err(Error::new(
+                    ErrorKind::Disconnected,
+                    "peer closed the channel",
+                ))
             }
             Ok(n) => Ok(n),
             Err(error) => {
@@ -235,7 +240,10 @@ impl Transport {
         match self.stream.try_read(buf) {
             Ok(0) => {
                 self.closed.store(true, Ordering::Release);
-                Err(Error::new(ErrorKind::Disconnected, "peer closed the channel"))
+                Err(Error::new(
+                    ErrorKind::Disconnected,
+                    "peer closed the channel",
+                ))
             }
             Ok(n) => Ok(n),
             Err(error) => {
@@ -265,9 +273,7 @@ impl ShmSender {
         let header = self.region.header();
         let (head, tail) = self.side.return_atomics(header);
         let ring = self.side.return_ring(&self.layout);
-        while let Some(entry) =
-            ring::pop_return(&self.region, ring, head, tail)
-        {
+        while let Some(entry) = ring::pop_return(&self.region, ring, head, tail) {
             self.buddy
                 .borrow_mut()
                 .free(entry.offset, entry.len as usize);
@@ -332,18 +338,12 @@ impl ShmSender {
                 "message ring is full (apply backpressure)",
             ));
         }
-        if !self
-            .side
-            .send_notified(header)
-            .swap(true, Ordering::AcqRel)
-        {
+        if !self.side.send_notified(header).swap(true, Ordering::AcqRel) {
             transport.wake();
             stats.wakeups_sent.fetch_add(1, Ordering::Relaxed);
         }
         stats.sent_messages.fetch_add(1, Ordering::Relaxed);
-        stats
-            .sent_bytes
-            .fetch_add(len as u64, Ordering::Relaxed);
+        stats.sent_bytes.fetch_add(len as u64, Ordering::Relaxed);
         Ok(())
     }
 
@@ -362,7 +362,10 @@ struct ReturnQueue {
 
 impl ReturnQueue {
     fn push(&self, offset: u32, len: u32) {
-        let _guard = self.lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = self
+            .lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let header = self.region.header();
         let (head, tail) = self.owner.return_atomics(header);
         if !ring::push_return(
@@ -409,11 +412,12 @@ impl ShmReceiver {
         let offset = slot.offset as usize;
         let len = slot.len as usize;
         let peer_half = self.side.peer_half(&self.layout);
-        let valid = len > 0
-            && len <= self.layout.max_message
+        let valid = len <= self.layout.max_message
             && offset >= peer_half
-            && offset + len <= peer_half + self.layout.half_len
-            && offset % self.layout.min_unit == 0;
+            && offset
+                .checked_add(len)
+                .is_some_and(|end| end <= peer_half + self.layout.half_len)
+            && offset.is_multiple_of(self.layout.min_unit);
         if !valid {
             transport.poison();
             return Err(Error::protocol(format!(
@@ -463,11 +467,8 @@ impl FrameReader {
         if self.buffered() < 8 {
             return Ok(None);
         }
-        let len = u32::from_le_bytes(
-            self.buffer[self.start..self.start + 4]
-                .try_into()
-                .unwrap(),
-        ) as usize;
+        let len = u32::from_le_bytes(self.buffer[self.start..self.start + 4].try_into().unwrap())
+            as usize;
         if len > max_message {
             return Err(Error::protocol(format!(
                 "peer announced a {len} B stream frame, limit is {max_message}"
@@ -499,7 +500,10 @@ enum SenderBackend {
 
 enum ReceiverBackend {
     Shm(ShmReceiver),
-    Stream { max_message: usize, reader: RefCell<FrameReader> },
+    Stream {
+        max_message: usize,
+        reader: RefCell<FrameReader>,
+    },
 }
 
 /// Sending half of a channel.
@@ -546,16 +550,9 @@ impl Sender {
     }
 
     /// Send, waiting up to `timeout` for capacity.
-    pub fn send_timeout(
-        &self,
-        kind: u32,
-        payload: &[u8],
-        timeout: Duration,
-    ) -> Result<()> {
+    pub fn send_timeout(&self, kind: u32, payload: &[u8], timeout: Duration) -> Result<()> {
         match &self.backend {
-            SenderBackend::Stream => {
-                self.transport.write_frame(kind, payload, Some(timeout))
-            }
+            SenderBackend::Stream => self.transport.write_frame(kind, payload, Some(timeout)),
             SenderBackend::Shm(sender) => {
                 let deadline = Instant::now() + timeout;
                 let mut backoff = Duration::from_micros(20);
@@ -613,11 +610,7 @@ impl Sender {
                 self.stats.allocations.fetch_add(1, Ordering::Relaxed);
                 // SAFETY: the buddy allocator just handed this block to us and
                 // no other code can reference it until the `Outgoing` is consumed.
-                let buffer = unsafe {
-                    sender
-                        .region
-                        .slice_mut(offset as usize, len)
-                };
+                let buffer = unsafe { sender.region.slice_mut(offset as usize, len) };
                 Ok(Outgoing {
                     state: OutgoingState::Shm {
                         sender,
@@ -634,7 +627,6 @@ impl Sender {
                 state: OutgoingState::Buffered {
                     sender: self,
                     buffer: vec![0u8; len],
-                    published: false,
                 },
             }),
         }
@@ -660,12 +652,11 @@ impl Receiver {
     /// Non-blocking receive.
     pub fn try_recv(&self) -> Result<Option<Message>> {
         match &self.backend {
-            ReceiverBackend::Shm(receiver) => {
-                receiver.try_recv(&self.stats, &self.transport)
-            }
-            ReceiverBackend::Stream { max_message, reader } => {
-                self.try_recv_stream(*max_message, reader)
-            }
+            ReceiverBackend::Shm(receiver) => receiver.try_recv(&self.stats, &self.transport),
+            ReceiverBackend::Stream {
+                max_message,
+                reader,
+            } => self.try_recv_stream(*max_message, reader),
         }
     }
 
@@ -730,10 +721,7 @@ impl Receiver {
                     if let Some(message) = receiver.try_recv(&self.stats, &self.transport)? {
                         return Ok(message);
                     }
-                    return Err(Error::new(
-                        ErrorKind::Disconnected,
-                        "channel is closed",
-                    ));
+                    return Err(Error::new(ErrorKind::Disconnected, "channel is closed"));
                 }
                 let left = remaining(deadline);
                 if matches!(left, Some(left) if left.is_zero()) {
@@ -747,16 +735,17 @@ impl Receiver {
                         return Err(error);
                     }
                     Err(error) => {
-                        if let Some(message) =
-                            receiver.try_recv(&self.stats, &self.transport)?
-                        {
+                        if let Some(message) = receiver.try_recv(&self.stats, &self.transport)? {
                             return Ok(message);
                         }
                         return Err(error);
                     }
                 }
             },
-            ReceiverBackend::Stream { max_message, reader } => {
+            ReceiverBackend::Stream {
+                max_message,
+                reader,
+            } => {
                 let mut chunk = [0u8; STREAM_CHUNK];
                 loop {
                     {
@@ -813,7 +802,6 @@ enum OutgoingState<'a> {
     Buffered {
         sender: &'a Sender,
         buffer: Vec<u8>,
-        published: bool,
     },
     Empty,
 }
@@ -826,7 +814,7 @@ pub struct Outgoing<'a> {
 
 impl Outgoing<'_> {
     /// Mutable view of the reserved bytes.
-    pub fn as_mut(&mut self) -> &mut [u8] {
+    pub fn buffer_mut(&mut self) -> &mut [u8] {
         match &mut self.state {
             OutgoingState::Shm { buffer, .. } => buffer,
             OutgoingState::Buffered { buffer, .. } => buffer.as_mut_slice(),
@@ -845,16 +833,11 @@ impl Outgoing<'_> {
                 offset,
                 len,
                 published: _,
-                buffer,
-            } => {
-                drop(buffer);
-                sender.publish(offset, len, kind, transport, stats)
+                buffer: _,
+            } => sender.publish(offset, len, kind, transport, stats),
+            OutgoingState::Buffered { sender, buffer } => {
+                sender.send_timeout(kind, &buffer, DEFAULT_SEND_TIMEOUT)
             }
-            OutgoingState::Buffered {
-                sender,
-                buffer,
-                published: _,
-            } => sender.send_timeout(kind, &buffer, DEFAULT_SEND_TIMEOUT),
             OutgoingState::Empty => Err(Error::new(ErrorKind::Internal, "empty reservation")),
         }
     }
@@ -868,12 +851,9 @@ impl Drop for Outgoing<'_> {
             len,
             published: false,
             ..
-        } = self.state
+        } = &self.state
         {
-            sender.free(offset, len);
-        }
-        if let OutgoingState::Buffered { published: false, .. } = self.state {
-            // Nothing was written; dropping the buffer is enough.
+            sender.free(*offset, *len);
         }
     }
 }
@@ -965,6 +945,11 @@ impl Channel {
         self.sender.send_timeout(kind, payload, timeout)
     }
 
+    /// Attempt to send once without waiting for capacity.
+    pub fn try_send(&self, kind: u32, payload: &[u8]) -> Result<()> {
+        self.sender.try_send(kind, payload)
+    }
+
     /// Receive with an optional deadline.
     pub fn recv(&self, timeout: Option<Duration>) -> Result<Message> {
         self.receiver.recv(timeout)
@@ -973,6 +958,16 @@ impl Channel {
     /// Non-blocking receive.
     pub fn try_recv(&self) -> Result<Option<Message>> {
         self.receiver.try_recv()
+    }
+
+    /// Reserve a payload buffer for a zero-copy send.
+    pub fn reserve(&self, len: usize) -> Result<Outgoing<'_>> {
+        self.sender.reserve(len)
+    }
+
+    /// Largest payload accepted by this channel.
+    pub fn max_message_len(&self) -> usize {
+        self.sender.max_message_len()
     }
 
     /// Transport selected during setup.
@@ -996,15 +991,9 @@ impl Channel {
     }
 }
 
-impl Drop for Channel {
-    fn drop(&mut self) {
-        self.close();
-    }
-}
-
 fn build_shm(role: Side, region: Arc<Region>, stream: Stream) -> Result<Channel> {
     let layout = Layout::from_header(region.header())?;
-    let transport = Arc::new(Transport::new(stream, Mode::SharedMemory));
+    let transport = Arc::new(Transport::new(stream));
     let stats = Arc::new(Stats::default());
     let buddy = Buddy::new(
         role.own_half(&layout) as u32,
@@ -1047,7 +1036,7 @@ fn build_shm(role: Side, region: Arc<Region>, stream: Stream) -> Result<Channel>
 }
 
 fn build_stream(stream: Stream, max_message: usize) -> Channel {
-    let transport = Arc::new(Transport::new(stream, Mode::Stream));
+    let transport = Arc::new(Transport::new(stream));
     let stats = Arc::new(Stats::default());
     Channel {
         sender: Sender {
@@ -1073,11 +1062,7 @@ fn build_stream(stream: Stream, max_message: usize) -> Channel {
 pub fn connect(name: &str, config: Config) -> Result<Channel> {
     config.validate()?;
     let stream = sys::connect(name, !config.force_stream)?;
-    stream.send_handshake(
-        &Hello::new(&config).encode(),
-        None,
-        Some(HANDSHAKE_TIMEOUT),
-    )?;
+    stream.send_handshake(&Hello::new(&config).encode(), None, Some(HANDSHAKE_TIMEOUT))?;
     let (welcome_bytes, handle) = stream.recv_handshake(Some(HANDSHAKE_TIMEOUT))?;
     let welcome = Welcome::decode(&welcome_bytes)?;
     if welcome.status != status::OK {
@@ -1149,16 +1134,16 @@ pub(crate) fn accept_stream(
 
     let mut region = None;
     let mut handle: Option<ShmHandle> = None;
-    if !config.force_stream && !hello.prefer_stream {
-        if let Ok(layout) = Layout::new(config) {
-            if let Ok((map, shm_handle)) = sys::create_shm(config.region_len) {
-                // SAFETY: the mapping is private to this process until the
-                // handshake publishes it, and it is large enough for the header.
-                unsafe { initialize_header(map.as_ptr(), &layout, ABI_VERSION) };
-                region = Some(Region::new(map));
-                handle = Some(shm_handle);
-            }
-        }
+    if !config.force_stream
+        && !hello.prefer_stream
+        && let Ok(layout) = Layout::new(config)
+        && let Ok((map, shm_handle)) = sys::create_shm(config.region_len)
+    {
+        // SAFETY: the mapping is private to this process until the handshake
+        // publishes it, and it is large enough for the header.
+        unsafe { initialize_header(map.as_ptr(), &layout, ABI_VERSION) };
+        region = Some(Region::new(map));
+        handle = Some(shm_handle);
     }
 
     let mode = if region.is_some() {
@@ -1184,20 +1169,20 @@ pub(crate) fn accept_stream(
 /// in-process tests, benchmarks and worker pools.
 pub fn pair(config: Config) -> Result<(Channel, Channel)> {
     config.validate()?;
-    if !config.force_stream {
-        if let Ok((map, handle)) = sys::create_shm(config.region_len) {
-            drop(handle);
-            let layout = Layout::new(&config)?;
-            // SAFETY: the region is local until both channels are built.
-            unsafe { initialize_header(map.as_ptr(), &layout, ABI_VERSION) };
-            let region = Region::new(map);
-            let (first, second) = sys::socket_pair()?;
-            let client = build_shm(Side::Client, region.clone(), first)?;
-            let server = build_shm(Side::Server, region, second)?;
-            return Ok((client, server));
-        }
+    if !config.force_stream
+        && let Ok((map, handle)) = sys::create_shm(config.region_len)
+    {
+        drop(handle);
+        let layout = Layout::new(&config)?;
+        // SAFETY: the region is local until both channels are built.
+        unsafe { initialize_header(map.as_ptr(), &layout, ABI_VERSION) };
+        let region = Region::new(map);
+        let (first, second) = sys::socket_pair(!config.force_stream)?;
+        let client = build_shm(Side::Client, region.clone(), first)?;
+        let server = build_shm(Side::Server, region, second)?;
+        return Ok((client, server));
     }
-    let (first, second) = sys::socket_pair()?;
+    let (first, second) = sys::socket_pair(false)?;
     Ok((
         build_stream(first, config.max_message_len),
         build_stream(second, config.max_message_len),

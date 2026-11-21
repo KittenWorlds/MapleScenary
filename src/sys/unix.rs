@@ -4,16 +4,18 @@
 use std::io;
 use std::mem::{size_of, zeroed};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::ptr;
+#[cfg(not(target_os = "android"))]
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
+#[cfg(not(target_os = "android"))]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::{Error, ErrorKind, Result};
 
 /// Linux and Android support SOCK_SEQPACKET for `AF_UNIX`; Darwin does not.
-pub(crate) const SEQ_PACKET_SUPPORTED: bool =
-    cfg!(any(target_os = "linux", target_os = "android"));
+pub(crate) const SEQ_PACKET_SUPPORTED: bool = cfg!(any(target_os = "linux", target_os = "android"));
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 const SEND_FLAGS: libc::c_int = libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL;
@@ -54,10 +56,6 @@ fn deadline_after(timeout: Option<Duration>) -> Option<Instant> {
     timeout.map(|timeout| Instant::now() + timeout)
 }
 
-fn remaining(deadline: Option<Instant>) -> Option<Duration> {
-    deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()))
-}
-
 fn wait_fd(fd: RawFd, events: libc::c_short, deadline: Option<Instant>) -> Result<()> {
     loop {
         let timeout_ms = match deadline {
@@ -86,8 +84,7 @@ fn wait_fd(fd: RawFd, events: libc::c_short, deadline: Option<Instant>) -> Resul
             if pollfd.revents & libc::POLLNVAL != 0 {
                 return Err(Error::new(ErrorKind::Io, "invalid file descriptor"));
             }
-            if pollfd.revents & events != 0
-                || pollfd.revents & (libc::POLLHUP | libc::POLLERR) != 0
+            if pollfd.revents & events != 0 || pollfd.revents & (libc::POLLHUP | libc::POLLERR) != 0
             {
                 return Ok(());
             }
@@ -151,6 +148,7 @@ fn configure_stream(fd: RawFd) -> io::Result<()> {
 }
 
 /// A bound local endpoint.
+#[derive(Debug)]
 pub(crate) struct Listener {
     fd: RawFd,
     kind: StreamKind,
@@ -179,7 +177,8 @@ impl Listener {
                 }
             }
         }
-        Err(last_error.unwrap_or_else(|| Error::new(ErrorKind::Unsupported, "no usable socket type")))
+        Err(last_error
+            .unwrap_or_else(|| Error::new(ErrorKind::Unsupported, "no usable socket type")))
     }
 
     fn bind_kind(endpoint: &Endpoint, kind: StreamKind) -> Result<Self> {
@@ -201,13 +200,13 @@ impl Listener {
         }
         let guard = FdGuard(fd);
 
-        if let Endpoint::Path(path) = endpoint {
-            if path.exists() {
-                return Err(Error::new(
-                    ErrorKind::AddrInUse,
-                    format!("endpoint {} already exists", path.display()),
-                ));
-            }
+        if let Endpoint::Path(path) = endpoint
+            && path.exists()
+        {
+            return Err(Error::new(
+                ErrorKind::AddrInUse,
+                format!("endpoint {} already exists", path.display()),
+            ));
         }
         let (addr, len) = endpoint.sockaddr()?;
         // SAFETY: `addr`/`len` describe a valid `sockaddr_un`.
@@ -228,10 +227,6 @@ impl Listener {
         };
         let fd = guard.into_raw();
         Ok(Self { fd, kind, path })
-    }
-
-    pub(crate) fn kind(&self) -> StreamKind {
-        self.kind
     }
 
     pub(crate) fn accept(&self, timeout: Option<Duration>) -> Result<Stream> {
@@ -309,7 +304,7 @@ pub(crate) fn connect(name: &str, prefer_seqpacket: bool) -> Result<Stream> {
             }
             return Err(error);
         }
-        return Ok(Stream::new(guard.into_raw(), kind));
+        return Ok(Stream::new(guard.into_raw(), *kind));
     }
     Err(last_error.unwrap_or_else(|| Error::new(ErrorKind::Unsupported, "no usable socket type")))
 }
@@ -345,7 +340,9 @@ impl Endpoint {
         }
         if let Some(rest) = name.strip_prefix('@') {
             if rest.is_empty() {
-                return Err(Error::invalid_config("abstract endpoint name must not be empty"));
+                return Err(Error::invalid_config(
+                    "abstract endpoint name must not be empty",
+                ));
             }
             if !SEQ_PACKET_SUPPORTED {
                 return Err(Error::new(
@@ -420,10 +417,6 @@ impl Stream {
         Self { fd, kind }
     }
 
-    pub(crate) fn kind(&self) -> StreamKind {
-        self.kind
-    }
-
     pub(crate) fn shutdown(&self) {
         // SAFETY: shutdown never closes the descriptor.
         unsafe {
@@ -448,7 +441,10 @@ impl Stream {
                 continue;
             }
             if sent == 0 {
-                return Err(Error::new(ErrorKind::Disconnected, "peer closed the socket"));
+                return Err(Error::new(
+                    ErrorKind::Disconnected,
+                    "peer closed the socket",
+                ));
             }
             let errno = last_errno();
             if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
@@ -459,7 +455,10 @@ impl Stream {
                 continue;
             }
             if errno == libc::EPIPE || errno == libc::ECONNRESET {
-                return Err(Error::new(ErrorKind::Disconnected, "peer closed the socket"));
+                return Err(Error::new(
+                    ErrorKind::Disconnected,
+                    "peer closed the socket",
+                ));
             }
             return Err(os_error("send"));
         }
@@ -492,7 +491,10 @@ impl Stream {
                     continue;
                 }
                 if errno == libc::EPIPE || errno == libc::ECONNRESET {
-                    return Err(Error::new(ErrorKind::Disconnected, "peer closed the socket"));
+                    return Err(Error::new(
+                        ErrorKind::Disconnected,
+                        "peer closed the socket",
+                    ));
                 }
                 return Err(os_error("send wakeup"));
             }
@@ -518,7 +520,10 @@ impl Stream {
                 return Ok(());
             }
             if received == 0 {
-                return Err(Error::new(ErrorKind::Disconnected, "peer closed the socket"));
+                return Err(Error::new(
+                    ErrorKind::Disconnected,
+                    "peer closed the socket",
+                ));
             }
             if received < 0 {
                 let errno = last_errno();
@@ -578,18 +583,6 @@ impl Stream {
         }
     }
 
-    pub(crate) fn read_exact(&self, mut buf: &mut [u8], timeout: Option<Duration>) -> Result<()> {
-        let deadline = deadline_after(timeout);
-        while !buf.is_empty() {
-            let n = self.read_some(buf, remaining(deadline))?;
-            if n == 0 {
-                return Err(Error::new(ErrorKind::Disconnected, "peer closed the socket"));
-            }
-            buf = &mut buf[n..];
-        }
-        Ok(())
-    }
-
     pub(crate) fn send_handshake(
         &self,
         payload: &[u8],
@@ -610,7 +603,10 @@ impl Stream {
             };
             let sent = self.sendmsg(&frame[offset..], fd, deadline)?;
             if sent == 0 {
-                return Err(Error::new(ErrorKind::Disconnected, "peer closed the socket"));
+                return Err(Error::new(
+                    ErrorKind::Disconnected,
+                    "peer closed the socket",
+                ));
             }
             offset += sent;
             first = false;
@@ -657,7 +653,10 @@ impl Stream {
         while !buf.is_empty() {
             let (received, received_fd) = self.recvmsg(buf, deadline)?;
             if received == 0 {
-                return Err(Error::new(ErrorKind::Disconnected, "peer closed the socket"));
+                return Err(Error::new(
+                    ErrorKind::Disconnected,
+                    "peer closed the socket",
+                ));
             }
             if received_fd.is_some() {
                 *fd = received_fd;
@@ -680,7 +679,7 @@ impl Stream {
         if let Some(fd) = fd {
             msg.msg_control = control.as_mut_ptr().cast::<libc::c_void>();
             msg.msg_controllen =
-                libc::CMSG_SPACE(size_of::<RawFd>() as libc::c_uint) as _;
+                unsafe { libc::CMSG_SPACE(size_of::<RawFd>() as libc::c_uint) } as _;
             // SAFETY: the control buffer is large enough for one `SCM_RIGHTS` header.
             unsafe {
                 let cmsg = libc::CMSG_FIRSTHDR(&msg);
@@ -705,7 +704,10 @@ impl Stream {
                 continue;
             }
             if errno == libc::EPIPE || errno == libc::ECONNRESET {
-                return Err(Error::new(ErrorKind::Disconnected, "peer closed the socket"));
+                return Err(Error::new(
+                    ErrorKind::Disconnected,
+                    "peer closed the socket",
+                ));
             }
             return Err(os_error("sendmsg"));
         }
@@ -740,8 +742,7 @@ impl Stream {
                         if (*cmsg).cmsg_level == libc::SOL_SOCKET
                             && (*cmsg).cmsg_type == libc::SCM_RIGHTS
                         {
-                            let raw =
-                                ptr::read_unaligned(libc::CMSG_DATA(cmsg).cast::<RawFd>());
+                            let raw = ptr::read_unaligned(libc::CMSG_DATA(cmsg).cast::<RawFd>());
                             received_fd = Some(OwnedFd::from_raw_fd(raw));
                         }
                         cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
@@ -779,8 +780,8 @@ impl Drop for Stream {
 }
 
 /// Create a connected pair of sockets for in-process channels.
-pub(crate) fn socket_pair() -> Result<(Stream, Stream)> {
-    let kind = if SEQ_PACKET_SUPPORTED {
+pub(crate) fn socket_pair(prefer_seqpacket: bool) -> Result<(Stream, Stream)> {
+    let kind = if prefer_seqpacket && SEQ_PACKET_SUPPORTED {
         StreamKind::SeqPacket
     } else {
         StreamKind::Stream
@@ -793,10 +794,7 @@ pub(crate) fn socket_pair() -> Result<(Stream, Stream)> {
     }
     configure_stream(fds[0]).map_err(|err| Error::io("configure socketpair", err))?;
     configure_stream(fds[1]).map_err(|err| Error::io("configure socketpair", err))?;
-    Ok((
-        Stream::new(fds[0], kind),
-        Stream::new(fds[1], kind),
-    ))
+    Ok((Stream::new(fds[0], kind), Stream::new(fds[1], kind)))
 }
 
 /// A shared-memory file descriptor that can be passed to the peer.
@@ -807,6 +805,11 @@ pub(crate) struct ShmHandle {
 impl ShmHandle {
     fn new(fd: OwnedFd) -> Self {
         Self { fd }
+    }
+
+    /// Unix passes the mapping as a file descriptor, so no name is needed.
+    pub(crate) fn name(&self) -> &str {
+        ""
     }
 }
 
@@ -840,6 +843,7 @@ impl Drop for Map {
     }
 }
 
+#[cfg(not(target_os = "android"))]
 static SHM_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn create_shm_fd() -> Result<RawFd> {
@@ -855,19 +859,38 @@ fn create_shm_fd() -> Result<RawFd> {
         if errno != libc::ENOSYS {
             return Err(os_error("memfd_create"));
         }
+        // Android does not expose `shm_open` through `libc`; every supported
+        // Android release has `memfd_create`, so treat ENOSYS as unsupported.
+        #[cfg(target_os = "android")]
+        return Err(os_error("memfd_create"));
     }
+    #[cfg(not(target_os = "android"))]
+    open_named_shm()
+}
+
+#[cfg(not(target_os = "android"))]
+fn open_named_shm() -> Result<RawFd> {
+    // Keep the name short: Darwin limits shared-memory names to 31 bytes.
+    let salt = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0);
     let unique = format!(
-        "/maple-{}-{}-{}",
+        "/mpl{:x}{:x}{:x}",
         std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0),
-        SHM_COUNTER.fetch_add(1, Ordering::Relaxed)
+        SHM_COUNTER.fetch_add(1, Ordering::Relaxed),
+        salt & 0xffff
     );
-    let name = std::ffi::CString::new(unique).map_err(|_| Error::new(ErrorKind::Internal, "invalid shm name"))?;
+    let name = std::ffi::CString::new(unique)
+        .map_err(|_| Error::new(ErrorKind::Internal, "invalid shm name"))?;
     // SAFETY: valid NUL-terminated name.
-    let fd = unsafe { libc::shm_open(name.as_ptr(), libc::O_CREAT | libc::O_EXCL | libc::O_RDWR, 0o600) };
+    let fd = unsafe {
+        libc::shm_open(
+            name.as_ptr(),
+            libc::O_CREAT | libc::O_EXCL | libc::O_RDWR,
+            0o600,
+        )
+    };
     if fd < 0 {
         return Err(os_error("shm_open"));
     }
@@ -923,11 +946,4 @@ impl FdGuard {
 
 pub(crate) fn attach_shm(handle: ShmHandle, len: usize) -> Result<Map> {
     map_fd(handle.fd.as_raw_fd(), len)
-}
-
-/// Remove a filesystem endpoint if it exists. Used by the test harness.
-pub(crate) fn remove_endpoint(name: &str) {
-    if !name.starts_with('@') {
-        let _ = std::fs::remove_file(Path::new(name));
-    }
 }

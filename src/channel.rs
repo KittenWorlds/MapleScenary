@@ -26,6 +26,17 @@ const STREAM_CHUNK: usize = 64 * 1024;
 /// syscall lands, so a short spin avoids two syscalls per message.
 const RECV_SPIN_ROUNDS: u32 = 64;
 
+/// Platform handle for the channel's control socket or pipe.
+///
+/// On Unix this is a `RawFd`, on Windows a `RawHandle`. It is the descriptor a
+/// host event loop should watch to be notified about doorbells; [`Watcher`]
+/// wraps the same logic when the host would rather block in Rust.
+#[cfg(unix)]
+pub type EventHandle = std::os::fd::RawFd;
+/// Platform handle for the channel's control socket or pipe.
+#[cfg(windows)]
+pub type EventHandle = std::os::windows::io::RawHandle;
+
 /// Snapshot of channel counters, useful for benchmarks and diagnostics.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ChannelStats {
@@ -187,6 +198,39 @@ impl Transport {
                 }
                 Err(error)
             }
+        }
+    }
+
+    /// Wait for readability without consuming anything.
+    fn wait_readable(&self, timeout: Option<Duration>) -> Result<()> {
+        match self.stream.wait_ready(timeout) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                if error.kind() == ErrorKind::Disconnected {
+                    self.closed.store(true, Ordering::Release);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn event_handle(&self) -> EventHandle {
+        self.stream.event_handle()
+    }
+
+    /// Non-destructive "bytes are waiting" probe. Peer closure marks the
+    /// transport closed instead of surfacing as an error.
+    fn peek_readable(&self) -> Result<bool> {
+        if self.is_closed() {
+            return Ok(false);
+        }
+        match self.stream.peek_ready() {
+            Ok(ready) => Ok(ready),
+            Err(error) if error.kind() == ErrorKind::Disconnected => {
+                self.closed.store(true, Ordering::Release);
+                Ok(false)
+            }
+            Err(error) => Err(error),
         }
     }
 
@@ -448,6 +492,14 @@ struct ShmReceiver {
 }
 
 impl ShmReceiver {
+    /// Non-destructive check used by [`Watcher`]; does not touch the ring or the
+    /// `notified` flag.
+    fn has_message(&self) -> bool {
+        let header = self.region.header();
+        let (head, tail) = self.side.recv_ring_atomics(header);
+        head.load(Ordering::Acquire) != tail.load(Ordering::Relaxed)
+    }
+
     fn try_recv(&self, stats: &Stats, transport: &Transport) -> Result<Option<Message>> {
         let header = self.region.header();
         let ring = self.side.recv_ring(&self.layout);
@@ -519,6 +571,18 @@ impl FrameReader {
             self.start = 0;
         }
         self.buffer.extend_from_slice(data);
+    }
+
+    /// Whether a complete frame is buffered, without consuming it. A frame that
+    /// already exceeds `max_message` also counts, so the caller surfaces the
+    /// protocol error instead of waiting forever.
+    fn has_frame(&self, max_message: usize) -> bool {
+        if self.buffered() < 8 {
+            return false;
+        }
+        let len = u32::from_le_bytes(self.buffer[self.start..self.start + 4].try_into().unwrap())
+            as usize;
+        len > max_message || self.buffered() >= 8 + len
     }
 
     fn next(&mut self, max_message: usize) -> Result<Option<(u32, Vec<u8>)>> {
@@ -717,6 +781,23 @@ impl Sender {
         self.transport.close();
     }
 
+    /// Descriptor or handle a host event loop can watch for doorbell activity.
+    ///
+    /// The value is borrowed from the channel: do not close it, and stop
+    /// watching it before dropping the channel. Availability of the handle does
+    /// not mean capacity is available; use [`Sender::try_send`] for that.
+    pub fn event_handle(&self) -> EventHandle {
+        self.transport.event_handle()
+    }
+
+    /// Whether closure has been observed on this side.
+    ///
+    /// Closure is asynchronous: it becomes `true` after an operation (or a
+    /// [`Watcher::wait`]) sees the peer go away, not at the instant it happens.
+    pub fn is_closed(&self) -> bool {
+        self.transport.is_closed()
+    }
+
     /// Current counters.
     pub fn stats(&self) -> ChannelStats {
         self.stats.snapshot()
@@ -727,6 +808,52 @@ impl Receiver {
     /// Largest payload accepted by this channel.
     pub fn max_message_len(&self) -> usize {
         self.max_message
+    }
+
+    /// Descriptor or handle a host event loop can watch for doorbells.
+    ///
+    /// See [`Sender::event_handle`] for the ownership rules.
+    pub fn event_handle(&self) -> EventHandle {
+        self.transport.event_handle()
+    }
+
+    /// Whether closure has been observed on this side.
+    pub fn is_closed(&self) -> bool {
+        self.transport.is_closed()
+    }
+
+    /// Borrow this half as a [`Watcher`] to integrate with an event loop.
+    pub fn watcher(&self) -> Watcher<'_> {
+        Watcher { receiver: self }
+    }
+
+    /// Non-destructive readiness probe. For shared memory this inspects ring
+    /// indices; for the stream fallback it peeks at the socket.
+    fn peek_message(&self) -> Result<bool> {
+        match &self.backend {
+            ReceiverBackend::Shm(receiver) => Ok(receiver.has_message()),
+            ReceiverBackend::Stream {
+                max_message,
+                reader,
+            } => {
+                if reader.borrow().has_frame(*max_message) {
+                    return Ok(true);
+                }
+                self.transport.peek_readable()
+            }
+        }
+    }
+
+    /// Block until something happens on the receive side.
+    ///
+    /// Shared memory waits on the one-byte doorbell (consuming it). The stream
+    /// fallback must not consume: the same socket carries frame bytes, so it
+    /// waits on readability instead.
+    fn wait_activity(&self, timeout: Option<Duration>) -> Result<()> {
+        match &self.backend {
+            ReceiverBackend::Shm(_) => self.transport.wait(timeout),
+            ReceiverBackend::Stream { .. } => self.transport.wait_readable(timeout),
+        }
     }
 
     /// Non-blocking receive.
@@ -874,6 +1001,97 @@ impl Receiver {
     /// Current counters.
     pub fn stats(&self) -> ChannelStats {
         self.stats.snapshot()
+    }
+}
+
+/// Outcome of [`Watcher::wait`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ready {
+    /// At least one message can be received with [`Receiver::try_recv`].
+    Readable,
+    /// The peer closed the channel. Messages that were published before the
+    /// close may still be drained with [`Receiver::try_recv`].
+    Closed,
+    /// The deadline elapsed before anything happened.
+    Timeout,
+}
+
+/// Event-loop friendly view of a [`Receiver`].
+///
+/// `recv` parks the calling thread inside the middleware. A host that already
+/// owns an event loop (a browser compositor, a UI toolkit, an async runtime)
+/// can instead watch [`Receiver::event_handle`] directly, or use this helper to
+/// get the same semantics without the extra syscalls of a timeout loop:
+///
+/// ```
+/// use std::time::Duration;
+/// use maple_scenary::{pair, Config, Ready};
+///
+/// let (a, b) = pair(Config::compact()).unwrap();
+/// let watcher = b.watcher();
+/// assert_eq!(watcher.wait(Some(Duration::from_millis(5))).unwrap(), Ready::Timeout);
+/// a.send(1, b"hi").unwrap();
+/// assert_eq!(watcher.wait(Some(Duration::from_secs(1))).unwrap(), Ready::Readable);
+/// assert_eq!(b.try_recv().unwrap().unwrap().bytes(), b"hi");
+/// ```
+pub struct Watcher<'a> {
+    receiver: &'a Receiver,
+}
+
+impl<'a> Watcher<'a> {
+    /// Descriptor or handle the underlying receiver exposes to an event loop.
+    pub fn event_handle(&self) -> EventHandle {
+        self.receiver.transport.event_handle()
+    }
+
+    /// Wait until a message is ready, the peer closes, or `timeout` elapses.
+    ///
+    /// The probe is non-destructive: the returned message is still delivered by
+    /// [`Receiver::try_recv`]. A timeout is reported as [`Ready::Timeout`], not
+    /// as an error.
+    pub fn wait(&self, timeout: Option<Duration>) -> Result<Ready> {
+        let receiver = self.receiver;
+        let deadline = timeout.map(|timeout| Instant::now() + timeout);
+        loop {
+            if receiver.peek_message()? {
+                return Ok(Ready::Readable);
+            }
+            if receiver.transport.is_closed() {
+                // A message may have been published right before the close.
+                return if receiver.peek_message()? {
+                    Ok(Ready::Readable)
+                } else {
+                    Ok(Ready::Closed)
+                };
+            }
+            let left = remaining(deadline);
+            if matches!(left, Some(left) if left.is_zero()) {
+                return Ok(Ready::Timeout);
+            }
+            match receiver.wait_activity(left) {
+                Ok(()) => {
+                    receiver
+                        .stats
+                        .wakeups_received
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                Err(error) if error.kind() == ErrorKind::Timeout => return Ok(Ready::Timeout),
+                Err(error) => {
+                    if receiver.peek_message()? {
+                        return Ok(Ready::Readable);
+                    }
+                    if receiver.transport.is_closed() {
+                        return Ok(Ready::Closed);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+    }
+
+    /// Non-blocking form of [`wait`](Self::wait).
+    pub fn try_wait(&self) -> Result<Ready> {
+        self.wait(Some(Duration::ZERO))
     }
 }
 
@@ -1071,6 +1289,23 @@ impl Channel {
     /// Split into independent halves.
     pub fn split(self) -> (Sender, Receiver) {
         (self.sender, self.receiver)
+    }
+
+    /// Descriptor or handle a host event loop can watch for doorbells.
+    ///
+    /// See [`Sender::event_handle`] for the ownership rules.
+    pub fn event_handle(&self) -> EventHandle {
+        self.receiver.event_handle()
+    }
+
+    /// Whether closure has been observed on this side.
+    pub fn is_closed(&self) -> bool {
+        self.receiver.is_closed()
+    }
+
+    /// Borrow the receiving half as a [`Watcher`].
+    pub fn watcher(&self) -> Watcher<'_> {
+        self.receiver.watcher()
     }
 
     /// Close both directions. Idempotent.

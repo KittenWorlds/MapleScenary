@@ -526,6 +526,56 @@ impl Stream {
         }
     }
 
+    /// Descriptor a host event loop can poll for doorbell activity.
+    ///
+    /// The descriptor stays owned by the channel: callers must not close it and
+    /// must stop watching it once the channel is dropped. Because the shared
+    /// memory data plane publishes before the doorbell, `POLLIN` means "a
+    /// message may be ready", not "exactly one message is ready".
+    pub(crate) fn event_handle(&self) -> RawFd {
+        self.fd
+    }
+
+    /// Wait until the socket is readable without consuming a byte.
+    ///
+    /// Unlike [`Stream::wait_wake`] this never drains the doorbell, so it is
+    /// safe on the stream fallback where the same descriptor carries frames.
+    pub(crate) fn wait_ready(&self, timeout: Option<Duration>) -> Result<()> {
+        wait_fd(self.fd, libc::POLLIN, deadline_after(timeout))
+    }
+
+    /// Non-destructive readiness probe: `true` when bytes are pending, `false`
+    /// when the socket is empty, `Disconnected` at end-of-stream.
+    pub(crate) fn peek_ready(&self) -> Result<bool> {
+        let mut byte = [0u8; 1];
+        // SAFETY: `byte` is a valid one-byte buffer; `MSG_PEEK` does not consume.
+        let received = unsafe {
+            libc::recv(
+                self.fd,
+                byte.as_mut_ptr().cast::<libc::c_void>(),
+                1,
+                libc::MSG_DONTWAIT | libc::MSG_PEEK,
+            )
+        };
+        if received > 0 {
+            return Ok(true);
+        }
+        if received == 0 {
+            return Err(Error::new(
+                ErrorKind::Disconnected,
+                "peer closed the socket",
+            ));
+        }
+        let errno = last_errno();
+        if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK || errno == libc::EINTR {
+            return Ok(false);
+        }
+        if errno == libc::ECONNRESET {
+            return Err(Error::new(ErrorKind::Disconnected, "peer reset the socket"));
+        }
+        Err(os_error("recv"))
+    }
+
     /// Write a small prefix and the payload with one `sendmsg`, falling back to
     /// repeated calls for partial writes.
     pub(crate) fn send_vectored(

@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use maple_scenary::{Channel, Config, ErrorKind, Listener, Mode, pair};
+use maple_scenary::{Channel, Config, ErrorKind, Listener, Mode, Ready, pair};
 
 const WAIT: Option<Duration> = Some(Duration::from_secs(5));
 
@@ -209,4 +209,61 @@ fn typed_try_recv_is_non_blocking() {
     assert!(b.recv(Some(Duration::ZERO)).is_err());
     a.send(&7).expect("send");
     assert_eq!(b.recv(WAIT).expect("recv"), 7);
+}
+
+#[test]
+fn event_handle_is_live() {
+    let (client, _server) = pair(compact()).expect("pair");
+    #[cfg(unix)]
+    assert!(client.event_handle() >= 0);
+    #[cfg(windows)]
+    assert!(!client.event_handle().is_null());
+    assert_eq!(client.event_handle(), client.watcher().event_handle());
+}
+
+fn watcher_roundtrip(config: Config) {
+    let (client, server) = pair(config).expect("pair");
+    let watcher = server.watcher();
+    assert_eq!(watcher.try_wait().expect("probe"), Ready::Timeout);
+
+    let sender = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(20));
+        client.send(21, b"wake").expect("send");
+        client
+    });
+    assert_eq!(watcher.wait(WAIT).expect("wait"), Ready::Readable);
+
+    let message = server.try_recv().expect("try_recv").expect("message");
+    assert_eq!(message.kind(), 21);
+    assert_eq!(message.bytes(), b"wake");
+
+    let client = sender.join().expect("sender thread");
+    drop(client);
+    assert_eq!(watcher.wait(WAIT).expect("wait closed"), Ready::Closed);
+    assert!(server.is_closed());
+}
+
+#[test]
+fn watcher_wakes_shared_memory() {
+    watcher_roundtrip(compact());
+}
+
+#[test]
+fn watcher_wakes_stream() {
+    let mut config = compact();
+    config.force_stream = true;
+    watcher_roundtrip(config);
+}
+
+#[test]
+fn watcher_drains_before_reporting_close() {
+    let (client, server) = pair(compact()).expect("pair");
+    client.send(31, b"last").expect("send");
+    drop(client);
+
+    let watcher = server.watcher();
+    assert_eq!(watcher.wait(WAIT).expect("wait"), Ready::Readable);
+    let message = server.try_recv().expect("try_recv").expect("message");
+    assert_eq!(message.bytes(), b"last");
+    assert_eq!(watcher.wait(WAIT).expect("wait closed"), Ready::Closed);
 }
